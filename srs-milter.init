@@ -26,6 +26,7 @@ REVERSE=
 RECIP_ORIG_HEADER=
 LOCAL_MAIL_DOMAINS="example.com .allsubdomains.example.com"
 LOCAL_AUTH_DOMAIN=
+VIRTUAL_DB=
 SRS_SECRETS="secret"
 EXTRA_ARGS=
 
@@ -42,6 +43,7 @@ while [ ! -z $(eval "echo \$SOCKET${NUM}") ]; do
   LRECIP_ORIG_HEADER=${RECIP_ORIG_HEADER}
   LLOCAL_MAIL_DOMAINS=${LOCAL_MAIL_DOMAINS}
   LLOCAL_AUTH_DOMAIN=${LOCAL_AUTH_DOMAIN}
+  LVIRTUAL_DB=${VIRTUAL_DB}
   LSRS_SECRETS=${SRS_SECRETS}
   LEXTRA_ARGS=${EXTRA_ARGS}
   [ ! -z $(eval "echo \$SOCKET${NUM}") ] && LSOCKET=$(eval "echo \$SOCKET${NUM}")
@@ -50,6 +52,7 @@ while [ ! -z $(eval "echo \$SOCKET${NUM}") ]; do
   [ ! -z $(eval "echo \$RECIP_ORIG_HEADER${NUM}") ] && LRECIP_ORIG_HEADER=$(eval "echo \$RECIP_ORIG_HEADER${NUM}")
   [ ! -z $(eval "echo \$LOCAL_MAIL_DOMAINS${NUM}") ] && LLOCAL_MAIL_DOMAINS=$(eval "echo \$LOCAL_MAIL_DOMAINS${NUM}")
   [ ! -z $(eval "echo \$LOCAL_AUTH_DOMAIN${NUM}") ] && LLOCAL_AUTH_DOMAIN=$(eval "echo \$LOCAL_AUTH_DOMAIN${NUM}")
+  [ ! -z $(eval "echo \$VIRTUAL_DB${NUM}") ] && LVIRTUAL_DB=$(eval "echo \$VIRTUAL_DB${NUM}")
   [ ! -z $(eval "echo \$SRS_SECRETS${NUM}") ] && LSRS_SECRETS=$(eval "echo \$SRS_SECRETS${NUM}")
   [ ! -z $(eval "echo \$EXTRA_ARGS${NUM}") ] && LEXTRA_ARGS=$(eval "echo \$EXTRA_ARGS${NUM}")
   CMD_ARGS[${NUM}]=""
@@ -59,6 +62,7 @@ while [ ! -z $(eval "echo \$SOCKET${NUM}") ]; do
   CMD_ARGS[${NUM}]="${CMD_ARGS[${NUM}]} "$([ ! -z ${LRECIP_ORIG_HEADER} ] && echo "--local-recip-header=${LRECIP_ORIG_HEADER}")
   CMD_ARGS[${NUM}]="${CMD_ARGS[${NUM}]} "$([ ! -z "${LLOCAL_MAIL_DOMAINS}" ] && echo $(for i in ${LLOCAL_MAIL_DOMAINS}; do echo "--local-mail-domain=${i}"; done))
   CMD_ARGS[${NUM}]="${CMD_ARGS[${NUM}]} "$([ ! -z ${LLOCAL_AUTH_DOMAIN} ] && echo "--local-auth-domain=${LLOCAL_AUTH_DOMAIN}")
+  CMD_ARGS[${NUM}]="${CMD_ARGS[${NUM}]} "$([ ! -z ${LVIRTUAL_DB} ] && echo "--virtual-db=${LVIRTUAL_DB}")
   CMD_ARGS[${NUM}]="${CMD_ARGS[${NUM}]} "$([ ! -z "${LSRS_SECRETS}" ] && echo $(for i in ${LSRS_SECRETS}; do echo "--srs-secret=${i}"; done))
   CMD_ARGS[${NUM}]="${CMD_ARGS[${NUM}]} $LEXTRA_ARGS"
   NUM=$((${NUM}+1))
@@ -71,6 +75,7 @@ if [ ${#CMD_ARGS[*]} -eq 0 ]; then
   CMD_ARGS[0]="${CMD_ARGS[0]} "$([ ! -z ${RECIP_ORIG_HEADER} ] && echo "--local-recip-header=${RECIP_ORIG_HEADER}")
   CMD_ARGS[0]="${CMD_ARGS[0]} "$([ ! -z "${LOCAL_MAIL_DOMAINS}" ] && echo $(for i in ${LOCAL_MAIL_DOMAINS}; do echo "--local-mail-domain=${i}"; done))
   CMD_ARGS[0]="${CMD_ARGS[0]} "$([ ! -z ${LOCAL_AUTH_DOMAIN} ] && echo "--local-auth-domain=${LOCAL_AUTH_DOMAIN}")
+  CMD_ARGS[0]="${CMD_ARGS[0]} "$([ ! -z ${VIRTUAL_DB} ] && echo "--virtual-db=${VIRTUAL_DB}")
   CMD_ARGS[0]="${CMD_ARGS[0]} "$([ ! -z "${SRS_SECRETS}" ] && echo $(for i in ${SRS_SECRETS}; do echo "--srs-secret=${i}"; done))
   CMD_ARGS[0]="${CMD_ARGS[0]} $EXTRA_ARGS"
 fi

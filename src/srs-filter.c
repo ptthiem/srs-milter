@@ -12,11 +12,15 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
+#include <sys/file.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <ifaddrs.h>
 #include <net/if.h>
 
+#if 0
+#include "db.h"
+#endif
 #include "srs2.h"
 #include "spf2/spf.h"
 #include "libmilter/mfapi.h"
@@ -29,20 +33,33 @@
 #define SS_STATE_INVALID_CONN     0x01
 #define SS_STATE_INVALID_MSG      0x02
 
+#define DICT_DB_NELM            4096
+#define DICT_DB_CACHE           128*1024
+
 /* Global variables */
-static int connections;
+static int connections = 0;
+#if 0
+static DB *db = NULL;
+static int dbfd = -1;
+static time_t db_mtime = 0;
+#endif
 /* these should be read from command line or config file */
+static int CONFIG_verbose = 0;
 static int CONFIG_forward = 0;
 static int CONFIG_reverse = 0;
 static char *CONFIG_socket = NULL;
 static char *CONFIG_recip_orig_header = NULL;
 static char **CONFIG_local_mail_domains = NULL;
 static char *CONFIG_local_auth_domain = NULL;
+#if 0
+static char *CONFIG_virtual_db = NULL;
+#endif
 static char *CONFIG_spf_heloname = NULL;
 static union {
    struct sockaddr_in in;
    struct sockaddr_in6 in6;
 } CONFIG_spf_address;
+static int CONFIG_srs_always = 0;
 static char **CONFIG_srs_secrets = NULL;
 static int CONFIG_srs_alwaysrewrite = 0;
 static int CONFIG_srs_hashlength = 0;
@@ -62,6 +79,7 @@ struct srs_milter_data {
   int recip_remote;
   srs_t *srs;
 };
+
 
 
 int is_local_addr(const char *addr) {
@@ -94,6 +112,152 @@ int is_local_addr(const char *addr) {
 }
 
 
+#if 0
+// returns string with lookup value or NULL
+// caller must release allocated memory
+char *db_lookup(const char *key) {
+  char *ret = NULL;
+  char *keyLower;
+  struct stat st;
+  DBT db_key;
+  DBT db_value;
+  int lock_fd = -1;
+  int status;
+
+  // lock file
+  if ((lock_fd = open(CONFIG_virtual_db, O_RDONLY, 0644)) < 0) {
+    syslog(LOG_ERR, "create lock for %s: %s\n", CONFIG_virtual_db, strerror(errno));
+    return NULL;
+  }
+  while ((status = flock(lock_fd, LOCK_SH)) < 0 && errno == EINTR)
+    sleep(1);
+  if (status < 0) {
+    syslog(LOG_ERR, "faled to lock file %s: %s\n", CONFIG_virtual_db, strerror(errno));
+    close(lock_fd);
+    return NULL;
+  }
+
+  // check changes in db file
+  if (db) {
+    if (fstat(dbfd, &st) < 0) {
+      syslog(LOG_WARNING, "can't get %s mtime", CONFIG_virtual_db);
+      return NULL;
+    }
+
+    if (st.st_mtime != db_mtime) {
+      syslog(LOG_DEBUG, "database %s modified, closing", CONFIG_virtual_db);
+      if ((errno = db->close(db, 0)))
+        syslog(LOG_ERR, "database %s close: %s", CONFIG_virtual_db, strerror(errno));
+    }
+
+    db = NULL;
+    dbfd = -1;
+    db_mtime = 0;
+  }
+
+  // open/initialize database
+  if (!db) {
+    syslog(LOG_DEBUG, "opening database %s", CONFIG_virtual_db);
+
+    // open database
+    while (1) {
+      int db_flags;
+      db_flags = DB_FCNTL_LOCKING;
+      db_flags |= DB_RDONLY;
+      if ((errno = db_create(&db, 0, 0)) != 0) {
+        syslog(LOG_ERR, "create DB database: %s", strerror(errno));
+        break;
+      }
+      if (db == 0) {
+        syslog(LOG_ERR, "db_create null result");
+        break;
+      }
+      if ((errno = db->set_cachesize(db, 0, DICT_DB_CACHE, 0)) != 0) {
+        syslog(LOG_ERR, "set DB cache size %d", DICT_DB_CACHE);
+        break;
+      }
+      if (db->set_h_nelem(db, DICT_DB_NELM) != 0) {
+        syslog(LOG_ERR, "set DB hash element count %d:", DICT_DB_NELM);
+        break;
+      }
+      if ((errno = db->open(db, 0, CONFIG_virtual_db, 0, DB_HASH, db_flags, 0644)) != 0) {
+        syslog(LOG_ERR, "open database %s: %s", CONFIG_virtual_db, strerror(errno));
+        break;
+      }
+      if ((errno = db->fd(db, &dbfd)) != 0) {
+        syslog(LOG_ERR, "get database file descriptor: %s", strerror(errno));
+        break;
+      }
+      if (fstat(dbfd, &st) < 0) {
+        syslog(LOG_ERR, "can't get %s mtime: %s", CONFIG_virtual_db, strerror(errno));
+        break;
+      }
+      db_mtime = st.st_mtime;
+    }
+
+    // check if opening failed
+    if (dbfd == -1 || db_mtime == 0) {
+      flock(lock_fd, LOCK_UN);
+      close(lock_fd);
+      if (db) {
+        if ((errno = db->close(db, 0)))
+          syslog(LOG_ERR, "database %s close: %s", CONFIG_virtual_db, strerror(errno));
+        db = NULL;
+      }
+      dbfd = -1;
+      db_mtime = 0;
+      return NULL;
+    }
+  }
+
+  // lookup data
+  keyLower = (char *) malloc(strlen(key)+1);
+  if (keyLower) {
+    int i;
+    for (i = 0; key[i]; i++)
+      keyLower[i] = tolower(key[i]);
+    keyLower[i] = '\0';
+
+    memset(&db_key, 0, sizeof(db_key));
+    memset(&db_value, 0, sizeof(db_value));
+
+    db_key.data = (void *) keyLower;
+    db_key.size = strlen(keyLower) + 1;
+
+    if ((status = db->get(db, 0, &db_key, &db_value, 0)) < 0) {
+      switch (status) {
+      case DB_NOTFOUND:
+        syslog(LOG_DEBUG, "%s not found\n", (char *) db_key.data);
+        break;
+      case DB_KEYEMPTY:
+        syslog(LOG_DEBUG, "%s empty\n", (char *) db_key.data);
+        break;
+      default:
+        syslog(LOG_DEBUG, "lookup %s: %i", key, status);
+      }
+    } else {
+      ret = (char *) malloc(db_value.size+1);
+      if (ret)
+        strncpy(ret, db_value.data, db_value.size);
+      //printf("%s=%s\n", (char *) db_key.data, (char *) db_value.data);
+    }
+
+    // unlock file
+    while ((status = flock(lock_fd, LOCK_UN)) < 0 && errno == EINTR)
+      sleep(1);
+    if (status < 0)
+      syslog(LOG_ERR, "faled to unlock file %s: %s\n", CONFIG_virtual_db, strerror(errno));
+    if (close(lock_fd) < 0)
+      syslog(LOG_ERR, "failed to close file lock %s: %s\n", CONFIG_virtual_db, strerror(errno));
+
+    free(keyLower);
+  }
+
+  return ret;
+}
+#endif
+
+
 
 // https://www.milter.org/developers/api/xxfi_connect
 static sfsistat
@@ -102,13 +266,15 @@ xxfi_srs_milter_connect(SMFICTX* ctx, char *hostname, _SOCK_ADDR *hostaddr) {
 
   cd = (struct srs_milter_data*) malloc(sizeof(struct srs_milter_data));
   if (!cd) {
-    syslog(LOG_DEBUG, "conn# ?[?] - xxfi_srs_milter_connect(\"%s\", %p): can't allocate memory",
-           hostname, hostaddr);
+    if (CONFIG_verbose)
+      syslog(LOG_DEBUG, "conn# ?[?] - xxfi_srs_milter_connect(\"%s\", %p): can't allocate memory",
+             hostname, hostaddr);
     return SMFIS_TEMPFAIL;
   }
   if (smfi_setpriv(ctx, (void*) cd) != MI_SUCCESS) {
-    syslog(LOG_DEBUG, "conn# ?[?] - xxfi_srs_milter_connect(\"%s\", %p): can't set ctx data",
-           hostname, hostaddr);
+    if (CONFIG_verbose)
+      syslog(LOG_DEBUG, "conn# ?[?] - xxfi_srs_milter_connect(\"%s\", %p): can't set ctx data",
+             hostname, hostaddr);
     return SMFIS_TEMPFAIL;
   }
 
@@ -116,8 +282,9 @@ xxfi_srs_milter_connect(SMFICTX* ctx, char *hostname, _SOCK_ADDR *hostaddr) {
   cd->state = SS_STATE_NULL;
   cd->connection_num = ++connections; // this should be done in thread-safe way
 
-  syslog(LOG_DEBUG, "conn# %d[%i] - xxfi_srs_milter_connect(\"%s\", hostaddr)",
-         cd->connection_num, cd->state, hostname);
+  if (CONFIG_verbose)
+    syslog(LOG_DEBUG, "conn# %d[%i] - xxfi_srs_milter_connect(\"%s\", hostaddr)",
+           cd->connection_num, cd->state, hostname);
 
   return SMFIS_CONTINUE;
 }
@@ -132,13 +299,15 @@ xxfi_srs_milter_envfrom(SMFICTX* ctx, char** argv) {
   if (cd->state & SS_STATE_INVALID_CONN)
     return SMFIS_CONTINUE;
 
-  syslog(LOG_DEBUG, "conn# %d[%i] - xxfi_srs_milter_envfrom(\"%s\")",
-         cd->connection_num, cd->state, argv[0]);
+  if (CONFIG_verbose)
+    syslog(LOG_DEBUG, "conn# %d[%i] - xxfi_srs_milter_envfrom(\"%s\")",
+           cd->connection_num, cd->state, argv[0]);
 
   if (strlen(argv[0]) < 1 || strcmp(argv[0], "<>") == 0 || argv[0][0] != '<' || argv[0][strlen(argv[0])-1] != '>' || !strchr(argv[0], '@')) {
     cd->state |= SS_STATE_INVALID_MSG;
-    syslog(LOG_DEBUG, "conn# %d[%i] - xxfi_srs_milter_envfrom(\"%s\"): skipping \"MAIL FROM: %s\"",
-           cd->connection_num, cd->state, argv[0], argv[0]);
+    if (CONFIG_verbose)
+      syslog(LOG_DEBUG, "conn# %d[%i] - xxfi_srs_milter_envfrom(\"%s\"): skipping \"MAIL FROM: %s\"",
+             cd->connection_num, cd->state, argv[0], argv[0]);
     return SMFIS_CONTINUE;
   }
 
@@ -183,7 +352,7 @@ xxfi_srs_milter_envfrom(SMFICTX* ctx, char** argv) {
     return SMFIS_CONTINUE;
   }
   strncpy(cd->sender, argv[0]+1, strlen(argv[0])-2);
-  cd->sender[strlen(argv[0])-1] = '\0';
+  cd->sender[strlen(argv[0])-2] = '\0';
 
   // store MAIL FROM: arguments
   {
@@ -214,8 +383,9 @@ xxfi_srs_milter_envrcpt(SMFICTX* ctx, char** argv) {
   if (cd->state & SS_STATE_INVALID_CONN)
     return SMFIS_CONTINUE;
 
-  syslog(LOG_DEBUG, "conn# %d[%i] - xxfi_srs_milter_envrcpt(\"%s\")",
-         cd->connection_num, cd->state, argv[0]);
+  if (CONFIG_verbose)
+    syslog(LOG_DEBUG, "conn# %d[%i] - xxfi_srs_milter_envrcpt(\"%s\")",
+           cd->connection_num, cd->state, argv[0]);
 
   // get recipient address
   char *recip = (char *) malloc(strlen(argv[0])-1);
@@ -225,13 +395,15 @@ xxfi_srs_milter_envrcpt(SMFICTX* ctx, char** argv) {
     return SMFIS_CONTINUE;
   }
   strncpy(recip, argv[0]+1, strlen(argv[0])-2);
-  recip[strlen(argv[0])-1] = '\0';
+  recip[strlen(argv[0])-2] = '\0';
 
   if (!is_local_addr(recip)) {
     cd->recip_remote = 1;
   } else {
     // list of local SRS recipient addresses that should be reversed
-    if (SRS_IS_SRS_ADDRESS(recip)) {
+    if (recip[0] != '\0' && recip[1] != '\0' 
+        && recip[2] != '\0' && recip[3] != '\0'
+        && SRS_IS_SRS_ADDRESS(recip)) {
       int argc = 0;
 
       if (!cd->recip) {
@@ -270,11 +442,15 @@ xxfi_srs_milter_header(SMFICTX* ctx, char *headerf, char *headerv) {
   if (cd->state & (SS_STATE_INVALID_CONN | SS_STATE_INVALID_MSG))
     return SMFIS_CONTINUE;
 
-  if (!CONFIG_reverse)
+  if (!CONFIG_forward)
     return SMFIS_CONTINUE;
 
-  syslog(LOG_DEBUG, "conn# %d[%i] - xxfi_srs_milter_header(\"%s\", \"%s\")",
-         cd->connection_num, cd->state, headerf, headerv);
+  if (!CONFIG_recip_orig_header || strcasecmp(headerf, CONFIG_recip_orig_header) != 0)
+    return SMFIS_CONTINUE;
+
+  if (CONFIG_verbose)
+    syslog(LOG_DEBUG, "conn# %d[%i] - xxfi_srs_milter_header(\"%s\", \"%s\")",
+           cd->connection_num, cd->state, headerf, headerv);
 
   // Search for header with original recipient.
   // This header should be added by some content filter
@@ -284,7 +460,7 @@ xxfi_srs_milter_header(SMFICTX* ctx, char *headerf, char *headerv) {
 
     if (!cd->recip_orig) {
       cd->recip_orig = strdup(headerv);
-      if (cd->recip_orig) {
+      if (!cd->recip_orig) {
         // memory allocation problem
         cd->state |= SS_STATE_INVALID_MSG;
         return SMFIS_CONTINUE;
@@ -315,7 +491,8 @@ xxfi_srs_milter_eom(SMFICTX* ctx) {
   char *queue_id = smfi_getsymval(ctx, "{i}");
   if (!queue_id) queue_id = "unknown";
 
-  syslog(LOG_DEBUG, "conn# %d[%i][%s] - xxfi_srs_milter_eom()", cd->connection_num, cd->state, queue_id);
+  if (CONFIG_verbose)
+    syslog(LOG_DEBUG, "conn# %d[%i][%s] - xxfi_srs_milter_eom()", cd->connection_num, cd->state, queue_id);
 
   int fix_envfrom = 0;
 
@@ -323,20 +500,40 @@ xxfi_srs_milter_eom(SMFICTX* ctx) {
   // SPF can prevent forwarding, check if it is the case
   // for this particular sender domain
   if (CONFIG_forward && !is_local_addr(cd->sender) && cd->recip_remote) {
-    SPF_server_t *spf_server = NULL;
-    SPF_response_t *spf_response = NULL;
-    SPF_request_t *spf_request = NULL;
-    SPF_errcode_t spf_ret = SPF_E_SUCCESS;
-    char host[INET_ADDRSTRLEN+1];
 
-    // check if non-local MAIL FROM: sender domain has SPF data in DNS
-    if ((spf_server = SPF_server_new(SPF_DNS_RESOLV, 0))) {
-//      char *site;
-//      if ((site = smfi_getsymval(ctx, "j")))
-//        SPF_server_set_rec_dom(spf_server, site);
-//      else
-//        SPF_server_set_rec_dom(spf_server, "localhost");
-      if ((spf_request = SPF_request_new(spf_server))) {
+    if (CONFIG_srs_always) {
+
+      fix_envfrom = 1;
+
+    } else {
+      // check if non-local MAIL FROM: sender domain has SPF data in DNS
+
+      SPF_server_t *spf_server = NULL;
+      SPF_request_t *spf_request = NULL;
+      SPF_response_t *spf_response = NULL;
+      SPF_errcode_t spf_ret = SPF_E_SUCCESS;
+      char host[INET_ADDRSTRLEN+1];
+
+  syslog(LOG_DEBUG, "conn# %d[%i][%s] - xxfi_srs_milter_eom(): AAA", cd->connection_num, cd->state, queue_id);
+      while (1) {
+        if (!(spf_server = SPF_server_new(SPF_DNS_RESOLV, 0))) {
+          syslog(LOG_NOTICE, "conn# %d[%i][%s] - xxfi_srs_milter_eom(): libspf2 error SPF_server_new",
+                 cd->connection_num, cd->state, queue_id);
+          break;
+        }
+
+        // char *site;
+        // if ((site = smfi_getsymval(ctx, "j")))
+        //   SPF_server_set_rec_dom(spf_server, site);
+        // else
+        //  SPF_server_set_rec_dom(spf_server, "localhost");
+        if (!(spf_request = SPF_request_new(spf_server))) {
+          syslog(LOG_NOTICE, "conn# %d[%i][%s] - xxfi_srs_milter_eom(): libspf2 error SPF_request_new",
+                 cd->connection_num, cd->state, queue_id);
+          break;
+        }
+
+  syslog(LOG_DEBUG, "conn# %d[%i][%s] - xxfi_srs_milter_eom(): BBB", cd->connection_num, cd->state, queue_id);
         if (CONFIG_spf_address.in.sin_family == AF_INET) {
           SPF_request_set_ipv4(spf_request, CONFIG_spf_address.in.sin_addr);
           inet_ntop(AF_INET, &CONFIG_spf_address.in.sin_addr, host, sizeof(host));
@@ -344,37 +541,59 @@ xxfi_srs_milter_eom(SMFICTX* ctx) {
           SPF_request_set_ipv6(spf_request, CONFIG_spf_address.in6.sin6_addr);
           inet_ntop(AF_INET6, &CONFIG_spf_address.in6.sin6_addr, host, sizeof(host));
         }
-        while (1) {
-          spf_ret = SPF_request_set_helo_dom(spf_request, CONFIG_spf_heloname);
-          if (spf_ret != SPF_E_SUCCESS) break;
-          spf_ret = SPF_request_set_env_from(spf_request, cd->sender);
-          if (spf_ret != SPF_E_SUCCESS) break;
-          spf_ret = SPF_request_query_mailfrom(spf_request, &spf_response);
-          if (spf_ret != SPF_E_SUCCESS) break;
 
-          if (spf_response) {
-            SPF_result_t spf_result = SPF_response_result(spf_response);
+        spf_ret = SPF_request_set_helo_dom(spf_request, CONFIG_spf_heloname);
+        if (spf_ret != SPF_E_SUCCESS) break;
+        spf_ret = SPF_request_set_env_from(spf_request, cd->sender);
+        if (spf_ret != SPF_E_SUCCESS) break;
+        spf_ret = SPF_request_query_mailfrom(spf_request, &spf_response);
+        if (spf_ret != SPF_E_SUCCESS) break;
+
+        if (spf_response) {
+          SPF_result_t spf_result = SPF_response_result(spf_response);
+          if (CONFIG_verbose)
             syslog(LOG_DEBUG, "conn# %d[%i][%s] - xxfi_srs_milter_eom(): spf(%s, %s, %s) = %i (%s)",
-                   cd->connection_num, cd->state, queue_id, host, CONFIG_spf_heloname,
+                   cd->connection_num, cd->state, queue_id,
+                   host, CONFIG_spf_heloname,
                    cd->sender, spf_ret, SPF_strresult(spf_ret));
-            // TODO: make this configurable
-            // (I'm not sure if SRS "MAIL FROM:" sender adress format can
-            // cause some problems/mail rejection, so right now I'm taking
-            // conservative approach for SRS "MAIL FROM:" rewriting)
-            //if (!(status == SPF_RESULT_PASS || status == SPF_RESULT_NEUTRAL))
-            if (spf_result == SPF_RESULT_FAIL || spf_result == SPF_RESULT_SOFTFAIL)
-              fix_envfrom = 1;
-          }
+          // TODO: make this configurable
+          // (I'm not sure if SRS "MAIL FROM:" sender adress format can
+          // cause some problems/mail rejection, so right now I'm taking
+          // conservative approach for SRS "MAIL FROM:" rewriting)
+          //if (!(status == SPF_RESULT_PASS || status == SPF_RESULT_NEUTRAL))
+          if (spf_result == SPF_RESULT_FAIL || spf_result == SPF_RESULT_SOFTFAIL)
+            fix_envfrom = 1;
+        } else {
+          syslog(LOG_DEBUG, "conn# %d[%i][%s] - xxfi_srs_milter_eom(): spf(%s, %s, %s) NULL response?!",
+                 cd->connection_num, cd->state, queue_id, host,
+                 CONFIG_spf_heloname, cd->sender);
+        }
 
-          break;
-        }
-        if (spf_ret != SPF_E_SUCCESS) {
-          syslog(LOG_NOTICE, "conn# %d[%i][%s] - xxfi_srs_milter_eom(): libspf2 error %i (%s)",
-                 cd->connection_num, cd->state, queue_id, spf_ret, SPF_strerror(spf_ret));
-        }
+        break;
       }
+
+      if (spf_ret != SPF_E_SUCCESS) {
+        syslog(LOG_NOTICE, "conn# %d[%i][%s] - xxfi_srs_milter_eom(): libspf2 error %i (%s)",
+               cd->connection_num, cd->state, queue_id, spf_ret, SPF_strerror(spf_ret));
+      }
+
+      // free SPF resources
+      if (spf_response)
+        SPF_response_free(spf_response);
+      if (spf_request)
+        SPF_request_free(spf_request);
+      if (spf_server)
+        SPF_server_free(spf_server);
+
     }
   }
+
+  // use postfix virtual table to guess original recipient name
+  // only in case we have just one recipient
+  // FIXME: cd->recip is not correct!!!
+  //if (fix_envfrom && CONFIG_virtual_db && !cd->recip_orig)
+  //  if (cd->recip && cd->recip[0] && !cd->recip[1])
+  //    cd->recip_orig = db_lookup(cd->recip[0]);
 
   // try to guess mail address from auth name in case we
   // was not able to find original recipient in mail headers
@@ -391,8 +610,25 @@ xxfi_srs_milter_eom(SMFICTX* ctx) {
     }
   }
 
+  // debug log gathered data...
+  if (CONFIG_verbose) {
+    int i;
+    syslog(LOG_DEBUG, "conn# %d[%i][%s] - xxfi_srs_milter_eom(): forward = %i, reverse = %i, fix_envfrom = %i, recip_remote = %i",
+           cd->connection_num, cd->state, queue_id,
+           CONFIG_forward, CONFIG_reverse, fix_envfrom, cd->recip_remote);
+    syslog(LOG_DEBUG, "conn# %d[%i][%s] - xxfi_srs_milter_eom(): sender = %s%s",
+           cd->connection_num, cd->state, queue_id, cd->sender,
+           is_local_addr(cd->sender) ? " (local)" : "");
+    syslog(LOG_DEBUG, "conn# %d[%i][%s] - xxfi_srs_milter_eom(): recip_orig = %s",
+           cd->connection_num, cd->state, queue_id, cd->recip_orig);
+    for (i = 0; cd->recip && cd->recip[i]; i++)
+      syslog(LOG_DEBUG, "conn# %d[%i][%s] - xxfi_srs_milter_eom(): recip = %s%s",
+             cd->connection_num, cd->state, queue_id, cd->recip[i],
+             is_local_addr(cd->recip[i]) ? " (local)" : "");
+  }
+
+  // now, do some SRS magic...
   if ((fix_envfrom && cd->recip_orig) || (CONFIG_reverse && cd->recip)) {
-    // do some SRS magic...
     int i;
 
     if (!cd->srs) { // initialize & configure SRS
@@ -418,7 +654,6 @@ xxfi_srs_milter_eom(SMFICTX* ctx) {
 
     int srs_res;
     char *out = NULL;
-    char *queue_id = smfi_getsymval(ctx, "{i}");
 
     if (fix_envfrom && cd->recip_orig) {
       // modify MAIL FROM: address to SRS format
@@ -427,8 +662,9 @@ xxfi_srs_milter_eom(SMFICTX* ctx) {
           syslog(LOG_ERR, "conn# %d[%i][%s] - xxfi_srs_milter_eom(): smfi_chgfrom(ctx, %s, NULL) failed",
                  cd->connection_num, cd->state, queue_id, out);
         } else {
-          syslog(LOG_DEBUG, "conn# %d[%i][%s] - xxfi_srs_milter_eom(): smfi_chgfrom(ctx, %s, NULL) OK",
-                 cd->connection_num, cd->state, queue_id, out);
+          if (CONFIG_verbose)
+            syslog(LOG_DEBUG, "conn# %d[%i][%s] - xxfi_srs_milter_eom(): smfi_chgfrom(ctx, %s, NULL) OK",
+                   cd->connection_num, cd->state, queue_id, out);
         }
       } else {
         syslog(LOG_ERR, "conn# %d[%i][%s] - xxfi_srs_milter_eom(): srs_forward_alloc(srs, out, %s, %s) failed: %i (%s)",
@@ -450,8 +686,9 @@ xxfi_srs_milter_eom(SMFICTX* ctx) {
             syslog(LOG_ERR, "conn# %d[%i][%s] - xxfi_srs_milter_eom(): smfi_addrcpt(ctx, %s) failed",
                    cd->connection_num, cd->state, queue_id, out);
           } else {
-            syslog(LOG_DEBUG, "conn# %d[%i][%s] - xxfi_srs_milter_eom(): smfi_{del,add}rcpt(%s, %s) OK",
-                   cd->connection_num, cd->state, queue_id, cd->recip[i], out);
+            if (CONFIG_verbose)
+              syslog(LOG_DEBUG, "conn# %d[%i][%s] - xxfi_srs_milter_eom(): smfi_{del,add}rcpt(%s, %s) OK",
+                     cd->connection_num, cd->state, queue_id, cd->recip[i], out);
           }
         } else {
           syslog(LOG_ERR, "conn# %d[%i][%s] - xxfi_srs_milter_eom(): srs_reverse_alloc(srs, out, %s) failed: %i (%s)",
@@ -474,7 +711,8 @@ static sfsistat
 xxfi_srs_milter_close(SMFICTX* ctx) {
   struct srs_milter_data* cd = (struct srs_milter_data*) smfi_getpriv(ctx);
 
-  syslog(LOG_DEBUG, "conn# %d[%i] - xxfi_srs_milter_close()", cd->connection_num, cd->state);
+  if (CONFIG_verbose)
+    syslog(LOG_DEBUG, "conn# %d[%i] - xxfi_srs_milter_close()", cd->connection_num, cd->state);
 
   if (cd) {
     int i = 0;
@@ -542,7 +780,7 @@ void daemonize() {
   /* If we got a good PID, then
      we can exit the parent process. */
   if (pid > 0) {
-    syslog(LOG_DEBUG, "exiting parent process");
+    syslog(LOG_ERR, "exiting parent process");
     exit(EXIT_SUCCESS);
   }
 
@@ -554,15 +792,13 @@ void daemonize() {
   /* Create a new SID for the child process */
   sid = setsid();
   if (sid < 0) {
-    /* Log any failure here */
-    syslog(LOG_DEBUG, "can't create new SID: %s", strerror(errno));
+    syslog(LOG_ERR, "can't create new SID: %s", strerror(errno));
     exit(EXIT_FAILURE);
   }
 
   /* Change the current working directory */
   if ((chdir("/")) < 0) {
-    /* Log any failure here */
-    syslog(LOG_DEBUG, "can't chagne working directory: %s", strerror(errno));
+    syslog(LOG_ERR, "can't chagne working directory: %s", strerror(errno));
     exit(EXIT_FAILURE);
   }
 
@@ -591,6 +827,8 @@ void usage(char *argv0) {
   fprintf(stderr, "      this help message\n");
   fprintf(stderr, "  -d, --debug\n");
   fprintf(stderr, "      don't daemonize this process\n");
+  fprintf(stderr, "  -v, --verbose\n");
+  fprintf(stderr, "      verbose output\n");
   fprintf(stderr, "  -P, --pidfile\n");
   fprintf(stderr, "      filename where to store process PID\n");
   fprintf(stderr, "  -s, --socket\n");
@@ -660,6 +898,7 @@ int main(int argc, char* argv[]) {
          We distinguish them by their indices. */
       {"help",                   no_argument,       0, 'h'},
       {"debug",                  no_argument,       0, 'd'},
+      {"verbose",                no_argument,       0, 'v'},
       {"pidfile",                required_argument, 0, 'P'},
       {"socket",                 required_argument, 0, 's'},
       {"forward",                no_argument,       0, 'f'},
@@ -667,8 +906,12 @@ int main(int argc, char* argv[]) {
       {"local-recip-header",     required_argument, 0, 'p'},
       {"local-mail-domain",      required_argument, 0, 'm'},
       {"local-auth-domain",      required_argument, 0, 'u'},
+#if 0
+      {"virtual-db",             required_argument, 0, 't'},
+#endif
       {"spf-heloname",           required_argument, 0, 'l'},
       {"spf-address",            required_argument, 0, 'a'},
+      {"srs-always",             no_argument,       0, 'y'},
       {"srs-secret",             required_argument, 0, 'c'},
       {"srs-alwaysrewrite",      no_argument,       0, 'w'},
       {"srs-hashlength",         required_argument, 0, 'g'},
@@ -680,7 +923,7 @@ int main(int argc, char* argv[]) {
     /* getopt_long stores the option index here. */
     int option_index = 0;
 
-    c = getopt_long(argc, argv, "hdP:s:f:r:p:m:a:c:wg:i:x:e:",
+    c = getopt_long(argc, argv, "hdvP:s:f:r:p:m:u:t:l:a:yc:wg:i:x:e:",
                     long_options, &option_index);
 
     /* Detect the end of the options. */
@@ -705,6 +948,10 @@ int main(int argc, char* argv[]) {
 
       case 'd':
         debug_flag = 1;
+        break;
+
+      case 'v':
+        CONFIG_verbose = 1;
         break;
 
       case 'P':
@@ -745,6 +992,12 @@ int main(int argc, char* argv[]) {
         CONFIG_local_auth_domain = optarg;
         break;
 
+#if 0
+      case 't':
+        CONFIG_virtual_db = optarg;
+        break;
+#endif
+
       case 'c':
         i = 0;
         if (!CONFIG_srs_secrets) {
@@ -763,6 +1016,10 @@ int main(int argc, char* argv[]) {
 
       case 'a':
         address = optarg;
+        break;
+
+      case 'y':
+        CONFIG_srs_always = 1;
         break;
 
       case 'w':
@@ -828,6 +1085,22 @@ int main(int argc, char* argv[]) {
     // SRS library version
     // ???
 
+#if 0
+    // DB library version
+    int db_major_version, db_minor_version, db_patch_version;
+    db_version(&db_major_version, &db_minor_version, &db_patch_version);
+    if (db_major_version != DB_VERSION_MAJOR || db_minor_version != DB_VERSION_MINOR) {
+      fprintf(stderr, "incorrect version of Berkeley DB: "
+             "compiled against %d.%d.%d, run-time linked against %d.%d.%d",
+             DB_VERSION_MAJOR, DB_VERSION_MINOR, DB_VERSION_PATCH,
+             db_major_version, db_minor_version, db_patch_version);
+      exit(EXIT_FAILURE);
+    }
+    syslog(LOG_DEBUG, "DBD compiled against %d.%d.%d, run-time linked against %d.%d.%d",
+           DB_VERSION_MAJOR, DB_VERSION_MINOR, DB_VERSION_PATCH,
+           db_major_version, db_minor_version, db_patch_version);
+#endif
+
     // validate configuration
     if (!CONFIG_forward && !CONFIG_reverse) {
       usage(argv[0]);
@@ -879,6 +1152,22 @@ int main(int argc, char* argv[]) {
         freeifaddrs(ifAddrStruct);
     }
 
+#if 0
+    if (CONFIG_virtual_db) {
+      int fd;
+      if ((fd = open(CONFIG_virtual_db, O_RDONLY)) < 0) {
+        usage(argv[0]);
+        fprintf(stderr, "ERROR: failed to open %s (%s)\n", CONFIG_virtual_db, strerror(errno));
+        exit(EXIT_FAILURE);
+      }
+      if (close(fd) < 0) {
+        usage(argv[0]);
+        fprintf(stderr, "ERROR: failed to close %s (%s)\n", CONFIG_virtual_db, strerror(errno));
+        exit(EXIT_FAILURE);
+      }
+    }
+#endif
+
     if (!CONFIG_srs_secrets || !CONFIG_srs_secrets[0]) {
       usage(argv[0]);
       fprintf(stderr, "ERROR: missing srs-secrets configuration\n");
@@ -918,42 +1207,47 @@ int main(int argc, char* argv[]) {
     srs_free(srs);
 
     // print configuration
-    if (CONFIG_forward)
-      syslog(LOG_DEBUG, "config forward: %i", CONFIG_forward);
-    if (CONFIG_reverse)
-      syslog(LOG_DEBUG, "config reverse: %i", CONFIG_reverse);
-    if (CONFIG_socket)
-      syslog(LOG_DEBUG, "config socket: %s", CONFIG_socket);
-    if (CONFIG_recip_orig_header)
-      syslog(LOG_DEBUG, "config recip_orig_header: %s", CONFIG_recip_orig_header);
-    for (i = 0; CONFIG_local_mail_domains && CONFIG_local_mail_domains[i]; i++)
-      syslog(LOG_DEBUG, "config local_mail_domains: %s", CONFIG_local_mail_domains[i]);
-    if (CONFIG_local_auth_domain)
-      syslog(LOG_DEBUG, "config local_auth_domain: %s", CONFIG_local_auth_domain);
-    if (CONFIG_spf_heloname)
-      syslog(LOG_DEBUG, "config spf_heloname: %s", CONFIG_spf_heloname);
-    if (CONFIG_spf_address.in.sin_family == AF_INET) {
-      char host[INET_ADDRSTRLEN+1];
-      inet_ntop(AF_INET, &CONFIG_spf_address.in.sin_addr, host, INET_ADDRSTRLEN);
-      syslog(LOG_DEBUG, "config spf_address: %s (IP)", host);
-    } else {
-      char host[INET_ADDRSTRLEN+1];
-      inet_ntop(AF_INET6, &CONFIG_spf_address.in6.sin6_addr, host, INET_ADDRSTRLEN);
-      syslog(LOG_DEBUG, "config spf_address: %s (IPv6)", host);
+    if (CONFIG_verbose) {
+      if (CONFIG_forward)
+        syslog(LOG_DEBUG, "config forward: %i", CONFIG_forward);
+      if (CONFIG_reverse)
+        syslog(LOG_DEBUG, "config reverse: %i", CONFIG_reverse);
+      if (CONFIG_socket)
+        syslog(LOG_DEBUG, "config socket: %s", CONFIG_socket);
+      if (CONFIG_recip_orig_header)
+        syslog(LOG_DEBUG, "config recip_orig_header: %s", CONFIG_recip_orig_header);
+      for (i = 0; CONFIG_local_mail_domains && CONFIG_local_mail_domains[i]; i++)
+        syslog(LOG_DEBUG, "config local_mail_domains: %s", CONFIG_local_mail_domains[i]);
+      if (CONFIG_local_auth_domain)
+        syslog(LOG_DEBUG, "config local_auth_domain: %s", CONFIG_local_auth_domain);
+#if 0
+      if (CONFIG_virtual_db)
+        syslog(LOG_DEBUG, "config virtual_db: %s", CONFIG_virtual_db);
+#endif
+      if (CONFIG_spf_heloname)
+        syslog(LOG_DEBUG, "config spf_heloname: %s", CONFIG_spf_heloname);
+      if (CONFIG_spf_address.in.sin_family == AF_INET) {
+        char host[INET_ADDRSTRLEN+1];
+        inet_ntop(AF_INET, &CONFIG_spf_address.in.sin_addr, host, INET_ADDRSTRLEN);
+        syslog(LOG_DEBUG, "config spf_address: %s (IP)", host);
+      } else {
+        char host[INET_ADDRSTRLEN+1];
+        inet_ntop(AF_INET6, &CONFIG_spf_address.in6.sin6_addr, host, INET_ADDRSTRLEN);
+        syslog(LOG_DEBUG, "config spf_address: %s (IPv6)", host);
+      }
+      for (i = 0; CONFIG_srs_secrets && CONFIG_srs_secrets[i]; i++)
+        syslog(LOG_DEBUG, "config srs_secrets: %s", CONFIG_srs_secrets[i]);
+      if (CONFIG_srs_alwaysrewrite > 0)
+        syslog(LOG_DEBUG, "config srs_alwaysrewrite: %i", CONFIG_srs_alwaysrewrite);
+      if (CONFIG_srs_hashlength > 0)
+        syslog(LOG_DEBUG, "config srs_hashlength: %i", CONFIG_srs_hashlength);
+      if (CONFIG_srs_hashmin > 0)
+        syslog(LOG_DEBUG, "config srs_hashmin: %i", CONFIG_srs_hashmin);
+      if (CONFIG_srs_maxage > 0)
+        syslog(LOG_DEBUG, "config srs_maxage: %i", CONFIG_srs_maxage);
+      if (CONFIG_srs_separator != 0)
+        syslog(LOG_DEBUG, "config srs_separator: %c", CONFIG_srs_separator);
     }
-    for (i = 0; CONFIG_srs_secrets && CONFIG_srs_secrets[i]; i++)
-      syslog(LOG_DEBUG, "config srs_secrets: %s", CONFIG_srs_secrets[i]);
-    if (CONFIG_srs_alwaysrewrite > 0)
-      syslog(LOG_DEBUG, "config srs_alwaysrewrite: %i", CONFIG_srs_alwaysrewrite);
-    if (CONFIG_srs_hashlength > 0)
-      syslog(LOG_DEBUG, "config srs_hashlength: %i", CONFIG_srs_hashlength);
-    if (CONFIG_srs_hashmin > 0)
-      syslog(LOG_DEBUG, "config srs_hashmin: %i", CONFIG_srs_hashmin);
-    if (CONFIG_srs_maxage > 0)
-      syslog(LOG_DEBUG, "config srs_maxage: %i", CONFIG_srs_maxage);
-    if (CONFIG_srs_separator != 0)
-      syslog(LOG_DEBUG, "config srs_separator: %c", CONFIG_srs_separator);
-
   }
 
   {

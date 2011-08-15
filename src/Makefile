@@ -12,6 +12,7 @@ all:			srs-filter
 
 srs-filter:		srs-filter.o
 	$(CC) $(LDFLAGS) srs-filter.o -lmilter -lpthread -lspf2 -lsrs2 -o srs-filter
+#	$(CC) $(LDFLAGS) srs-filter.o -lmilter -lpthread -lspf2 -lsrs2 -ldb -o srs-filter
 
 .c.o:
 	$(CC) $(CFLAGS) -c $<
