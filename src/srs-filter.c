@@ -37,7 +37,9 @@
 #define DICT_DB_CACHE           128*1024
 
 /* Global variables */
+static pthread_key_t key;
 static int connections = 0;
+static int threads = 0;
 #if 0
 static DB *db = NULL;
 static int dbfd = -1;
@@ -69,15 +71,20 @@ static char CONFIG_srs_separator = 0;
 
 
 /* Per-connection data structure. */
-struct srs_milter_data {
-  int connection_num;
+struct srs_milter_connection_data {
+  int num;
   int state;
   char* sender;
   char** envfromargv;
   char** recip;
   char *recip_orig;
   int recip_remote;
+};
+/* Per-thread data structure. */
+struct srs_milter_thread_data {
+  int num;
   srs_t *srs;
+  SPF_server_t *spf;
 };
 
 
@@ -259,15 +266,59 @@ char *db_lookup(const char *key) {
 
 
 
+static void srs_milter_thread_data_destructor(void* data) {
+  if (!data)
+    return;
+
+  struct srs_milter_thread_data* td = (struct srs_milter_thread_data*) data;
+
+  if (td->srs)
+    srs_free(td->srs);
+
+  if (td->spf)
+    SPF_server_free(td->spf);
+
+  free(data);
+}
+
+
+
 // https://www.milter.org/developers/api/xxfi_connect
 static sfsistat
 xxfi_srs_milter_connect(SMFICTX* ctx, char *hostname, _SOCK_ADDR *hostaddr) {
-  struct srs_milter_data* cd;
+  struct srs_milter_thread_data* td;
+  struct srs_milter_connection_data* cd;
 
-  cd = (struct srs_milter_data*) malloc(sizeof(struct srs_milter_data));
+  // get/allocate thread specific data
+  td = (struct srs_milter_thread_data*) pthread_getspecific(key);
+  if (!td) {
+    td = (struct srs_milter_thread_data*) malloc( sizeof(struct srs_milter_thread_data) );
+    if (!td) {
+      syslog(LOG_ERR, "conn# ?[?] - xxfi_srs_milter_connect(\"%s\", %p): can't allocate memory for thread data",
+             hostname, hostaddr);
+      return SMFIS_TEMPFAIL;
+    }
+
+    bzero(td, sizeof(struct srs_milter_thread_data));
+    td->num = ++threads; // this should be done in thread-safe way
+
+    if (CONFIG_verbose)
+      syslog(LOG_DEBUG, "conn# ?[?] - xxfi_srs_milter_connect(\"%s\", %p): created new thread %i data",
+             hostname, hostaddr, td->num);
+
+    if (pthread_setspecific(key, td)) {
+      syslog(LOG_ERR, "conn# ?[?] - xxfi_srs_milter_connect(\"%s\", %p): can't store thread %i data",
+             hostname, hostaddr, td->num);
+      free(td);
+      return SMFIS_TEMPFAIL;
+    }
+  }
+
+  // allocate connection specific data
+  cd = (struct srs_milter_connection_data*) malloc(sizeof(struct srs_milter_connection_data));
   if (!cd) {
     if (CONFIG_verbose)
-      syslog(LOG_DEBUG, "conn# ?[?] - xxfi_srs_milter_connect(\"%s\", %p): can't allocate memory",
+      syslog(LOG_DEBUG, "conn# ?[?] - xxfi_srs_milter_connect(\"%s\", %p): can't allocate memory for connection data",
              hostname, hostaddr);
     return SMFIS_TEMPFAIL;
   }
@@ -278,13 +329,13 @@ xxfi_srs_milter_connect(SMFICTX* ctx, char *hostname, _SOCK_ADDR *hostaddr) {
     return SMFIS_TEMPFAIL;
   }
 
-  bzero(cd, sizeof(struct srs_milter_data));
+  bzero(cd, sizeof(struct srs_milter_connection_data));
   cd->state = SS_STATE_NULL;
-  cd->connection_num = ++connections; // this should be done in thread-safe way
+  cd->num = ++connections; // this should be done in thread-safe way
 
   if (CONFIG_verbose)
     syslog(LOG_DEBUG, "conn# %d[%i] - xxfi_srs_milter_connect(\"%s\", hostaddr)",
-           cd->connection_num, cd->state, hostname);
+           cd->num, cd->state, hostname);
 
   return SMFIS_CONTINUE;
 }
@@ -294,20 +345,20 @@ xxfi_srs_milter_connect(SMFICTX* ctx, char *hostname, _SOCK_ADDR *hostaddr) {
 // https://www.milter.org/developers/api/xxfi_envfrom
 static sfsistat
 xxfi_srs_milter_envfrom(SMFICTX* ctx, char** argv) {
-  struct srs_milter_data* cd = (struct srs_milter_data*) smfi_getpriv(ctx);
+  struct srs_milter_connection_data* cd = (struct srs_milter_connection_data*) smfi_getpriv(ctx);
 
   if (cd->state & SS_STATE_INVALID_CONN)
     return SMFIS_CONTINUE;
 
   if (CONFIG_verbose)
     syslog(LOG_DEBUG, "conn# %d[%i] - xxfi_srs_milter_envfrom(\"%s\")",
-           cd->connection_num, cd->state, argv[0]);
+           cd->num, cd->state, argv[0]);
 
   if (strlen(argv[0]) < 1 || strcmp(argv[0], "<>") == 0 || argv[0][0] != '<' || argv[0][strlen(argv[0])-1] != '>' || !strchr(argv[0], '@')) {
     cd->state |= SS_STATE_INVALID_MSG;
     if (CONFIG_verbose)
       syslog(LOG_DEBUG, "conn# %d[%i] - xxfi_srs_milter_envfrom(\"%s\"): skipping \"MAIL FROM: %s\"",
-             cd->connection_num, cd->state, argv[0], argv[0]);
+             cd->num, cd->state, argv[0], argv[0]);
     return SMFIS_CONTINUE;
   }
 
@@ -378,14 +429,14 @@ xxfi_srs_milter_envfrom(SMFICTX* ctx, char** argv) {
 // https://www.milter.org/developers/api/xxfi_envrcpt
 static sfsistat
 xxfi_srs_milter_envrcpt(SMFICTX* ctx, char** argv) {
-  struct srs_milter_data* cd = (struct srs_milter_data*) smfi_getpriv(ctx);
+  struct srs_milter_connection_data* cd = (struct srs_milter_connection_data*) smfi_getpriv(ctx);
 
   if (cd->state & SS_STATE_INVALID_CONN)
     return SMFIS_CONTINUE;
 
   if (CONFIG_verbose)
     syslog(LOG_DEBUG, "conn# %d[%i] - xxfi_srs_milter_envrcpt(\"%s\")",
-           cd->connection_num, cd->state, argv[0]);
+           cd->num, cd->state, argv[0]);
 
   // get recipient address
   char *recip = (char *) malloc(strlen(argv[0])-1);
@@ -437,7 +488,7 @@ xxfi_srs_milter_envrcpt(SMFICTX* ctx, char** argv) {
 // https://www.milter.org/developers/api/xxfi_header
 static sfsistat
 xxfi_srs_milter_header(SMFICTX* ctx, char *headerf, char *headerv) {
-  struct srs_milter_data* cd = (struct srs_milter_data*) smfi_getpriv(ctx);
+  struct srs_milter_connection_data* cd = (struct srs_milter_connection_data*) smfi_getpriv(ctx);
 
   if (cd->state & (SS_STATE_INVALID_CONN | SS_STATE_INVALID_MSG))
     return SMFIS_CONTINUE;
@@ -450,7 +501,7 @@ xxfi_srs_milter_header(SMFICTX* ctx, char *headerf, char *headerv) {
 
   if (CONFIG_verbose)
     syslog(LOG_DEBUG, "conn# %d[%i] - xxfi_srs_milter_header(\"%s\", \"%s\")",
-           cd->connection_num, cd->state, headerf, headerv);
+           cd->num, cd->state, headerf, headerv);
 
   // Search for header with original recipient.
   // This header should be added by some content filter
@@ -470,7 +521,7 @@ xxfi_srs_milter_header(SMFICTX* ctx, char *headerf, char *headerv) {
       // TODO: normalize header value before comparison
       if (strcasecmp(headerv, cd->recip_orig) != 0)
         syslog(LOG_WARNING, "conn# %d[%i] - xxfi_srs_milter_header(\"%s\", \"%s\"): duplicate %s to %s",
-               cd->connection_num, cd->state, headerf, headerv,
+               cd->num, cd->state, headerf, headerv,
                CONFIG_recip_orig_header, cd->recip_orig);
     }
   }
@@ -483,7 +534,7 @@ xxfi_srs_milter_header(SMFICTX* ctx, char *headerf, char *headerv) {
 // https://www.milter.org/developers/api/xxfi_eom
 static sfsistat
 xxfi_srs_milter_eom(SMFICTX* ctx) {
-  struct srs_milter_data* cd = (struct srs_milter_data*) smfi_getpriv(ctx);
+  struct srs_milter_connection_data* cd = (struct srs_milter_connection_data*) smfi_getpriv(ctx);
 
   if (cd->state & (SS_STATE_INVALID_CONN | SS_STATE_INVALID_MSG))
     return SMFIS_CONTINUE;
@@ -492,7 +543,7 @@ xxfi_srs_milter_eom(SMFICTX* ctx) {
   if (!queue_id) queue_id = "unknown";
 
   if (CONFIG_verbose)
-    syslog(LOG_DEBUG, "conn# %d[%i][%s] - xxfi_srs_milter_eom()", cd->connection_num, cd->state, queue_id);
+    syslog(LOG_DEBUG, "conn# %d[%i][%s] - xxfi_srs_milter_eom()", cd->num, cd->state, queue_id);
 
   int fix_envfrom = 0;
 
@@ -507,33 +558,45 @@ xxfi_srs_milter_eom(SMFICTX* ctx) {
 
     } else {
       // check if non-local MAIL FROM: sender domain has SPF data in DNS
-
-      SPF_server_t *spf_server = NULL;
+      struct srs_milter_thread_data* td;
       SPF_request_t *spf_request = NULL;
       SPF_response_t *spf_response = NULL;
       SPF_errcode_t spf_ret = SPF_E_SUCCESS;
       char host[INET_ADDRSTRLEN+1];
 
-  syslog(LOG_DEBUG, "conn# %d[%i][%s] - xxfi_srs_milter_eom(): AAA", cd->connection_num, cd->state, queue_id);
+      td = (struct srs_milter_thread_data*) pthread_getspecific(key);
+      if (!td) {
+        syslog(LOG_ERR, "conn# %d[%i][%s] - xxfi_srs_milter_eom(): can't get thread data!? (SPF)",
+               cd->num, cd->state, queue_id);
+        cd->state |= SS_STATE_INVALID_MSG;
+        return SMFIS_CONTINUE;
+      }
+
       while (1) {
-        if (!(spf_server = SPF_server_new(SPF_DNS_RESOLV, 0))) {
-          syslog(LOG_NOTICE, "conn# %d[%i][%s] - xxfi_srs_milter_eom(): libspf2 error SPF_server_new",
-                 cd->connection_num, cd->state, queue_id);
+        if (!td->spf) {
+          if (CONFIG_verbose)
+            syslog(LOG_DEBUG, "conn# %d[%i][%s][%i] - xxfi_srs_milter_eom(): SPF_server_new",
+                   cd->num, cd->state, queue_id, td->num);
+
+          if (!(td->spf = SPF_server_new(SPF_DNS_RESOLV, CONFIG_verbose))) {
+            syslog(LOG_NOTICE, "conn# %d[%i][%s][%i] - xxfi_srs_milter_eom(): libspf2 error SPF_server_new",
+                   cd->num, cd->state, queue_id, td->num);
+            break;
+          }
+
+          // char *site;
+          // if ((site = smfi_getsymval(ctx, "j")))
+          //   SPF_server_set_rec_dom(spf_server, site);
+          // else
+          //  SPF_server_set_rec_dom(spf_server, "localhost");
+        }
+
+        if (!(spf_request = SPF_request_new(td->spf))) {
+          syslog(LOG_NOTICE, "conn# %d[%i][%s][%i] - xxfi_srs_milter_eom(): libspf2 error SPF_request_new",
+                 cd->num, cd->state, queue_id, td->num);
           break;
         }
 
-        // char *site;
-        // if ((site = smfi_getsymval(ctx, "j")))
-        //   SPF_server_set_rec_dom(spf_server, site);
-        // else
-        //  SPF_server_set_rec_dom(spf_server, "localhost");
-        if (!(spf_request = SPF_request_new(spf_server))) {
-          syslog(LOG_NOTICE, "conn# %d[%i][%s] - xxfi_srs_milter_eom(): libspf2 error SPF_request_new",
-                 cd->connection_num, cd->state, queue_id);
-          break;
-        }
-
-  syslog(LOG_DEBUG, "conn# %d[%i][%s] - xxfi_srs_milter_eom(): BBB", cd->connection_num, cd->state, queue_id);
         if (CONFIG_spf_address.in.sin_family == AF_INET) {
           SPF_request_set_ipv4(spf_request, CONFIG_spf_address.in.sin_addr);
           inet_ntop(AF_INET, &CONFIG_spf_address.in.sin_addr, host, sizeof(host));
@@ -552,8 +615,8 @@ xxfi_srs_milter_eom(SMFICTX* ctx) {
         if (spf_response) {
           SPF_result_t spf_result = SPF_response_result(spf_response);
           if (CONFIG_verbose)
-            syslog(LOG_DEBUG, "conn# %d[%i][%s] - xxfi_srs_milter_eom(): spf(%s, %s, %s) = %i (%s)",
-                   cd->connection_num, cd->state, queue_id,
+            syslog(LOG_DEBUG, "conn# %d[%i][%s][%i] - xxfi_srs_milter_eom(): spf(%s, %s, %s) = %i (%s)",
+                   cd->num, cd->state, queue_id, td->num,
                    host, CONFIG_spf_heloname,
                    cd->sender, spf_ret, SPF_strresult(spf_ret));
           // TODO: make this configurable
@@ -564,17 +627,18 @@ xxfi_srs_milter_eom(SMFICTX* ctx) {
           if (spf_result == SPF_RESULT_FAIL || spf_result == SPF_RESULT_SOFTFAIL)
             fix_envfrom = 1;
         } else {
-          syslog(LOG_DEBUG, "conn# %d[%i][%s] - xxfi_srs_milter_eom(): spf(%s, %s, %s) NULL response?!",
-                 cd->connection_num, cd->state, queue_id, host,
-                 CONFIG_spf_heloname, cd->sender);
+          if (CONFIG_verbose)
+            syslog(LOG_DEBUG, "conn# %d[%i][%s][%i] - xxfi_srs_milter_eom(): spf(%s, %s, %s) NULL response?!",
+                   cd->num, cd->state, queue_id, td->num, host,
+                   CONFIG_spf_heloname, cd->sender);
         }
 
         break;
       }
 
       if (spf_ret != SPF_E_SUCCESS) {
-        syslog(LOG_NOTICE, "conn# %d[%i][%s] - xxfi_srs_milter_eom(): libspf2 error %i (%s)",
-               cd->connection_num, cd->state, queue_id, spf_ret, SPF_strerror(spf_ret));
+        syslog(LOG_NOTICE, "conn# %d[%i][%s][%i] - xxfi_srs_milter_eom(): libspf2 error %i (%s)",
+               cd->num, cd->state, queue_id, td->num, spf_ret, SPF_strerror(spf_ret));
       }
 
       // free SPF resources
@@ -582,8 +646,6 @@ xxfi_srs_milter_eom(SMFICTX* ctx) {
         SPF_response_free(spf_response);
       if (spf_request)
         SPF_request_free(spf_request);
-      if (spf_server)
-        SPF_server_free(spf_server);
 
     }
   }
@@ -614,42 +676,57 @@ xxfi_srs_milter_eom(SMFICTX* ctx) {
   if (CONFIG_verbose) {
     int i;
     syslog(LOG_DEBUG, "conn# %d[%i][%s] - xxfi_srs_milter_eom(): forward = %i, reverse = %i, fix_envfrom = %i, recip_remote = %i",
-           cd->connection_num, cd->state, queue_id,
+           cd->num, cd->state, queue_id,
            CONFIG_forward, CONFIG_reverse, fix_envfrom, cd->recip_remote);
     syslog(LOG_DEBUG, "conn# %d[%i][%s] - xxfi_srs_milter_eom(): sender = %s%s",
-           cd->connection_num, cd->state, queue_id, cd->sender,
+           cd->num, cd->state, queue_id, cd->sender,
            is_local_addr(cd->sender) ? " (local)" : "");
     syslog(LOG_DEBUG, "conn# %d[%i][%s] - xxfi_srs_milter_eom(): recip_orig = %s",
-           cd->connection_num, cd->state, queue_id, cd->recip_orig);
+           cd->num, cd->state, queue_id, cd->recip_orig);
     for (i = 0; cd->recip && cd->recip[i]; i++)
       syslog(LOG_DEBUG, "conn# %d[%i][%s] - xxfi_srs_milter_eom(): recip = %s%s",
-             cd->connection_num, cd->state, queue_id, cd->recip[i],
+             cd->num, cd->state, queue_id, cd->recip[i],
              is_local_addr(cd->recip[i]) ? " (local)" : "");
   }
 
   // now, do some SRS magic...
   if ((fix_envfrom && cd->recip_orig) || (CONFIG_reverse && cd->recip)) {
     int i;
+    struct srs_milter_thread_data* td;
 
-    if (!cd->srs) { // initialize & configure SRS
-      cd->srs = srs_new();
-      if (!cd->srs) {
+    td = (struct srs_milter_thread_data*) pthread_getspecific(key);
+    if (!td) {
+      syslog(LOG_ERR, "conn# %d[%i][%s] - xxfi_srs_milter_eom(): can't get thread data!? (SRS)",
+             cd->num, cd->state, queue_id);
+      cd->state |= SS_STATE_INVALID_MSG;
+      return SMFIS_CONTINUE;
+    }
+
+    if (!td->srs) { // initialize & configure SRS
+      if (CONFIG_verbose)
+        syslog(LOG_DEBUG, "conn# %d[%i][%s][%i] - xxfi_srs_milter_eom(): srs_new",
+               cd->num, cd->state, queue_id, td->num);
+
+      td->srs = srs_new();
+      if (!td->srs) {
+        syslog(LOG_ERR, "conn# %d[%i][%s][%i] - xxfi_srs_milter_eom(): can't initialize SRS",
+               cd->num, cd->state, queue_id, td->num);
         cd->state |= SS_STATE_INVALID_MSG;
         return SMFIS_CONTINUE;
       }
 
       if (CONFIG_srs_alwaysrewrite > 0)
-        srs_set_alwaysrewrite(cd->srs, CONFIG_srs_alwaysrewrite);
+        srs_set_alwaysrewrite(td->srs, CONFIG_srs_alwaysrewrite);
       if (CONFIG_srs_hashlength > 0)
-        srs_set_hashlength(cd->srs, CONFIG_srs_hashlength);
+        srs_set_hashlength(td->srs, CONFIG_srs_hashlength);
       if (CONFIG_srs_hashmin > 0)
-        srs_set_hashmin(cd->srs, CONFIG_srs_hashmin);
+        srs_set_hashmin(td->srs, CONFIG_srs_hashmin);
       if (CONFIG_srs_maxage > 0)
-        srs_set_maxage(cd->srs, CONFIG_srs_maxage);
+        srs_set_maxage(td->srs, CONFIG_srs_maxage);
       if (CONFIG_srs_separator != 0)
-        srs_set_separator(cd->srs, CONFIG_srs_separator);
+        srs_set_separator(td->srs, CONFIG_srs_separator);
       for (i = 0; CONFIG_srs_secrets && CONFIG_srs_secrets[i]; i++)
-        srs_add_secret(cd->srs, CONFIG_srs_secrets[i]);
+        srs_add_secret(td->srs, CONFIG_srs_secrets[i]);
     }
 
     int srs_res;
@@ -657,18 +734,18 @@ xxfi_srs_milter_eom(SMFICTX* ctx) {
 
     if (fix_envfrom && cd->recip_orig) {
       // modify MAIL FROM: address to SRS format
-      if ((srs_res = srs_forward_alloc(cd->srs, &out, cd->sender, cd->recip_orig)) == SRS_SUCCESS) {
+      if ((srs_res = srs_forward_alloc(td->srs, &out, cd->sender, cd->recip_orig)) == SRS_SUCCESS) {
         if (smfi_chgfrom(ctx, out, NULL) != MI_SUCCESS) {
-          syslog(LOG_ERR, "conn# %d[%i][%s] - xxfi_srs_milter_eom(): smfi_chgfrom(ctx, %s, NULL) failed",
-                 cd->connection_num, cd->state, queue_id, out);
+          syslog(LOG_ERR, "conn# %d[%i][%s][%i] - xxfi_srs_milter_eom(): smfi_chgfrom(ctx, %s, NULL) failed",
+                 cd->num, cd->state, queue_id, td->num, out);
         } else {
           if (CONFIG_verbose)
-            syslog(LOG_DEBUG, "conn# %d[%i][%s] - xxfi_srs_milter_eom(): smfi_chgfrom(ctx, %s, NULL) OK",
-                   cd->connection_num, cd->state, queue_id, out);
+            syslog(LOG_DEBUG, "conn# %d[%i][%s][%i] - xxfi_srs_milter_eom(): smfi_chgfrom(ctx, %s, NULL) OK",
+                   cd->num, cd->state, queue_id, td->num, out);
         }
       } else {
-        syslog(LOG_ERR, "conn# %d[%i][%s] - xxfi_srs_milter_eom(): srs_forward_alloc(srs, out, %s, %s) failed: %i (%s)",
-               cd->connection_num, cd->state, queue_id, cd->sender, cd->recip_orig, srs_res, srs_strerror(srs_res));
+        syslog(LOG_ERR, "conn# %d[%i][%s][%i] - xxfi_srs_milter_eom(): srs_forward_alloc(srs, out, %s, %s) failed: %i (%s)",
+               cd->num, cd->state, queue_id, td->num, cd->sender, cd->recip_orig, srs_res, srs_strerror(srs_res));
       }
 
       if (out)
@@ -678,21 +755,21 @@ xxfi_srs_milter_eom(SMFICTX* ctx) {
     if (CONFIG_reverse && cd->recip) {
       // modify RCPT TO: by removing SRS format
       for (i = 0; cd->recip[i]; i++) {
-        if ((srs_res = srs_reverse_alloc(cd->srs, &out, cd->recip[i])) == SRS_SUCCESS) {
+        if ((srs_res = srs_reverse_alloc(td->srs, &out, cd->recip[i])) == SRS_SUCCESS) {
           if (smfi_delrcpt(ctx, cd->recip[i]) != MI_SUCCESS) {
             syslog(LOG_ERR, "conn# %d[%i][%s] - xxfi_srs_milter_eom(): smfi_delrcpt(ctx, %s) failed",
-                   cd->connection_num, cd->state, queue_id, cd->recip[i]);
+                   cd->num, cd->state, queue_id, cd->recip[i]);
           } else if (smfi_addrcpt(ctx, out) != MI_SUCCESS) {
             syslog(LOG_ERR, "conn# %d[%i][%s] - xxfi_srs_milter_eom(): smfi_addrcpt(ctx, %s) failed",
-                   cd->connection_num, cd->state, queue_id, out);
+                   cd->num, cd->state, queue_id, out);
           } else {
             if (CONFIG_verbose)
               syslog(LOG_DEBUG, "conn# %d[%i][%s] - xxfi_srs_milter_eom(): smfi_{del,add}rcpt(%s, %s) OK",
-                     cd->connection_num, cd->state, queue_id, cd->recip[i], out);
+                     cd->num, cd->state, queue_id, cd->recip[i], out);
           }
         } else {
           syslog(LOG_ERR, "conn# %d[%i][%s] - xxfi_srs_milter_eom(): srs_reverse_alloc(srs, out, %s) failed: %i (%s)",
-                 cd->connection_num, cd->state, queue_id, cd->recip[i], srs_res, srs_strerror(srs_res));
+                 cd->num, cd->state, queue_id, cd->recip[i], srs_res, srs_strerror(srs_res));
         }
 
         if (out)
@@ -709,10 +786,10 @@ xxfi_srs_milter_eom(SMFICTX* ctx) {
 // https://www.milter.org/developers/api/xxfi_close
 static sfsistat
 xxfi_srs_milter_close(SMFICTX* ctx) {
-  struct srs_milter_data* cd = (struct srs_milter_data*) smfi_getpriv(ctx);
+  struct srs_milter_connection_data* cd = (struct srs_milter_connection_data*) smfi_getpriv(ctx);
 
   if (CONFIG_verbose)
-    syslog(LOG_DEBUG, "conn# %d[%i] - xxfi_srs_milter_close()", cd->connection_num, cd->state);
+    syslog(LOG_DEBUG, "conn# %d[%i] - xxfi_srs_milter_close()", cd->num, cd->state);
 
   if (cd) {
     int i = 0;
@@ -736,9 +813,6 @@ xxfi_srs_milter_close(SMFICTX* ctx) {
 
     if (cd->recip_orig)
       free(cd->recip_orig);
-
-    if (cd->srs)
-      srs_free(cd->srs);
 
     free(cd);
   }
@@ -1059,6 +1133,11 @@ int main(int argc, char* argv[]) {
     putchar ('\n');
   }
 
+  if (pthread_key_create(&key, &srs_milter_thread_data_destructor)) {
+      fprintf(stderr, "pthread_key_create failed");
+      exit(EXIT_FAILURE);
+  }
+
   openlog(SRS_MILTER_NAME, LOG_PID, LOG_MAIL);
   {
     int i;
@@ -1269,6 +1348,10 @@ int main(int argc, char* argv[]) {
   }
 
   syslog(LOG_INFO, "exitting");
+
+  pthread_key_delete(key);
+
   closelog();
+
   exit(EXIT_SUCCESS);
 }
