@@ -18,9 +18,6 @@
 #include <ifaddrs.h>
 #include <net/if.h>
 
-#if 0
-#include "db.h"
-#endif
 #include "srs2.h"
 #include "spf2/spf.h"
 #include "libmilter/mfapi.h"
@@ -33,18 +30,10 @@
 #define SS_STATE_INVALID_CONN     0x01
 #define SS_STATE_INVALID_MSG      0x02
 
-#define DICT_DB_NELM            4096
-#define DICT_DB_CACHE           128*1024
-
 /* Global variables */
 static pthread_key_t key;
 static int connections = 0;
 static int threads = 0;
-#if 0
-static DB *db = NULL;
-static int dbfd = -1;
-static time_t db_mtime = 0;
-#endif
 /* these should be read from command line or config file */
 static int CONFIG_verbose = 0;
 static int CONFIG_forward = 0;
@@ -53,9 +42,6 @@ static char *CONFIG_socket = NULL;
 static char *CONFIG_recip_orig_header = NULL;
 static char **CONFIG_local_mail_domains = NULL;
 static char *CONFIG_local_auth_domain = NULL;
-#if 0
-static char *CONFIG_virtual_db = NULL;
-#endif
 static char *CONFIG_spf_heloname = NULL;
 static union {
    struct sockaddr_in in;
@@ -117,152 +103,6 @@ int is_local_addr(const char *addr) {
 
   return 0;
 }
-
-
-#if 0
-// returns string with lookup value or NULL
-// caller must release allocated memory
-char *db_lookup(const char *key) {
-  char *ret = NULL;
-  char *keyLower;
-  struct stat st;
-  DBT db_key;
-  DBT db_value;
-  int lock_fd = -1;
-  int status;
-
-  // lock file
-  if ((lock_fd = open(CONFIG_virtual_db, O_RDONLY, 0644)) < 0) {
-    syslog(LOG_ERR, "create lock for %s: %s\n", CONFIG_virtual_db, strerror(errno));
-    return NULL;
-  }
-  while ((status = flock(lock_fd, LOCK_SH)) < 0 && errno == EINTR)
-    sleep(1);
-  if (status < 0) {
-    syslog(LOG_ERR, "faled to lock file %s: %s\n", CONFIG_virtual_db, strerror(errno));
-    close(lock_fd);
-    return NULL;
-  }
-
-  // check changes in db file
-  if (db) {
-    if (fstat(dbfd, &st) < 0) {
-      syslog(LOG_WARNING, "can't get %s mtime", CONFIG_virtual_db);
-      return NULL;
-    }
-
-    if (st.st_mtime != db_mtime) {
-      syslog(LOG_DEBUG, "database %s modified, closing", CONFIG_virtual_db);
-      if ((errno = db->close(db, 0)))
-        syslog(LOG_ERR, "database %s close: %s", CONFIG_virtual_db, strerror(errno));
-    }
-
-    db = NULL;
-    dbfd = -1;
-    db_mtime = 0;
-  }
-
-  // open/initialize database
-  if (!db) {
-    syslog(LOG_DEBUG, "opening database %s", CONFIG_virtual_db);
-
-    // open database
-    while (1) {
-      int db_flags;
-      db_flags = DB_FCNTL_LOCKING;
-      db_flags |= DB_RDONLY;
-      if ((errno = db_create(&db, 0, 0)) != 0) {
-        syslog(LOG_ERR, "create DB database: %s", strerror(errno));
-        break;
-      }
-      if (db == 0) {
-        syslog(LOG_ERR, "db_create null result");
-        break;
-      }
-      if ((errno = db->set_cachesize(db, 0, DICT_DB_CACHE, 0)) != 0) {
-        syslog(LOG_ERR, "set DB cache size %d", DICT_DB_CACHE);
-        break;
-      }
-      if (db->set_h_nelem(db, DICT_DB_NELM) != 0) {
-        syslog(LOG_ERR, "set DB hash element count %d:", DICT_DB_NELM);
-        break;
-      }
-      if ((errno = db->open(db, 0, CONFIG_virtual_db, 0, DB_HASH, db_flags, 0644)) != 0) {
-        syslog(LOG_ERR, "open database %s: %s", CONFIG_virtual_db, strerror(errno));
-        break;
-      }
-      if ((errno = db->fd(db, &dbfd)) != 0) {
-        syslog(LOG_ERR, "get database file descriptor: %s", strerror(errno));
-        break;
-      }
-      if (fstat(dbfd, &st) < 0) {
-        syslog(LOG_ERR, "can't get %s mtime: %s", CONFIG_virtual_db, strerror(errno));
-        break;
-      }
-      db_mtime = st.st_mtime;
-    }
-
-    // check if opening failed
-    if (dbfd == -1 || db_mtime == 0) {
-      flock(lock_fd, LOCK_UN);
-      close(lock_fd);
-      if (db) {
-        if ((errno = db->close(db, 0)))
-          syslog(LOG_ERR, "database %s close: %s", CONFIG_virtual_db, strerror(errno));
-        db = NULL;
-      }
-      dbfd = -1;
-      db_mtime = 0;
-      return NULL;
-    }
-  }
-
-  // lookup data
-  keyLower = (char *) malloc(strlen(key)+1);
-  if (keyLower) {
-    int i;
-    for (i = 0; key[i]; i++)
-      keyLower[i] = tolower(key[i]);
-    keyLower[i] = '\0';
-
-    memset(&db_key, 0, sizeof(db_key));
-    memset(&db_value, 0, sizeof(db_value));
-
-    db_key.data = (void *) keyLower;
-    db_key.size = strlen(keyLower) + 1;
-
-    if ((status = db->get(db, 0, &db_key, &db_value, 0)) < 0) {
-      switch (status) {
-      case DB_NOTFOUND:
-        syslog(LOG_DEBUG, "%s not found\n", (char *) db_key.data);
-        break;
-      case DB_KEYEMPTY:
-        syslog(LOG_DEBUG, "%s empty\n", (char *) db_key.data);
-        break;
-      default:
-        syslog(LOG_DEBUG, "lookup %s: %i", key, status);
-      }
-    } else {
-      ret = (char *) malloc(db_value.size+1);
-      if (ret)
-        strncpy(ret, db_value.data, db_value.size);
-      //printf("%s=%s\n", (char *) db_key.data, (char *) db_value.data);
-    }
-
-    // unlock file
-    while ((status = flock(lock_fd, LOCK_UN)) < 0 && errno == EINTR)
-      sleep(1);
-    if (status < 0)
-      syslog(LOG_ERR, "faled to unlock file %s: %s\n", CONFIG_virtual_db, strerror(errno));
-    if (close(lock_fd) < 0)
-      syslog(LOG_ERR, "failed to close file lock %s: %s\n", CONFIG_virtual_db, strerror(errno));
-
-    free(keyLower);
-  }
-
-  return ret;
-}
-#endif
 
 
 
@@ -980,9 +820,6 @@ int main(int argc, char* argv[]) {
       {"local-recip-header",     required_argument, 0, 'p'},
       {"local-mail-domain",      required_argument, 0, 'm'},
       {"local-auth-domain",      required_argument, 0, 'u'},
-#if 0
-      {"virtual-db",             required_argument, 0, 't'},
-#endif
       {"spf-heloname",           required_argument, 0, 'l'},
       {"spf-address",            required_argument, 0, 'a'},
       {"srs-always",             no_argument,       0, 'y'},
@@ -1065,12 +902,6 @@ int main(int argc, char* argv[]) {
       case 'u':
         CONFIG_local_auth_domain = optarg;
         break;
-
-#if 0
-      case 't':
-        CONFIG_virtual_db = optarg;
-        break;
-#endif
 
       case 'c':
         i = 0;
@@ -1164,22 +995,6 @@ int main(int argc, char* argv[]) {
     // SRS library version
     // ???
 
-#if 0
-    // DB library version
-    int db_major_version, db_minor_version, db_patch_version;
-    db_version(&db_major_version, &db_minor_version, &db_patch_version);
-    if (db_major_version != DB_VERSION_MAJOR || db_minor_version != DB_VERSION_MINOR) {
-      fprintf(stderr, "incorrect version of Berkeley DB: "
-             "compiled against %d.%d.%d, run-time linked against %d.%d.%d",
-             DB_VERSION_MAJOR, DB_VERSION_MINOR, DB_VERSION_PATCH,
-             db_major_version, db_minor_version, db_patch_version);
-      exit(EXIT_FAILURE);
-    }
-    syslog(LOG_DEBUG, "DBD compiled against %d.%d.%d, run-time linked against %d.%d.%d",
-           DB_VERSION_MAJOR, DB_VERSION_MINOR, DB_VERSION_PATCH,
-           db_major_version, db_minor_version, db_patch_version);
-#endif
-
     // validate configuration
     if (!CONFIG_forward && !CONFIG_reverse) {
       usage(argv[0]);
@@ -1230,22 +1045,6 @@ int main(int argc, char* argv[]) {
       if (ifAddrStruct!=NULL)
         freeifaddrs(ifAddrStruct);
     }
-
-#if 0
-    if (CONFIG_virtual_db) {
-      int fd;
-      if ((fd = open(CONFIG_virtual_db, O_RDONLY)) < 0) {
-        usage(argv[0]);
-        fprintf(stderr, "ERROR: failed to open %s (%s)\n", CONFIG_virtual_db, strerror(errno));
-        exit(EXIT_FAILURE);
-      }
-      if (close(fd) < 0) {
-        usage(argv[0]);
-        fprintf(stderr, "ERROR: failed to close %s (%s)\n", CONFIG_virtual_db, strerror(errno));
-        exit(EXIT_FAILURE);
-      }
-    }
-#endif
 
     if (!CONFIG_srs_secrets || !CONFIG_srs_secrets[0]) {
       usage(argv[0]);
@@ -1299,10 +1098,6 @@ int main(int argc, char* argv[]) {
         syslog(LOG_DEBUG, "config local_mail_domains: %s", CONFIG_local_mail_domains[i]);
       if (CONFIG_local_auth_domain)
         syslog(LOG_DEBUG, "config local_auth_domain: %s", CONFIG_local_auth_domain);
-#if 0
-      if (CONFIG_virtual_db)
-        syslog(LOG_DEBUG, "config virtual_db: %s", CONFIG_virtual_db);
-#endif
       if (CONFIG_spf_heloname)
         syslog(LOG_DEBUG, "config spf_heloname: %s", CONFIG_spf_heloname);
       if (CONFIG_spf_address.in.sin_family == AF_INET) {
