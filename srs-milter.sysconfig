@@ -4,10 +4,7 @@
 #SOCKET="inet:10040@localhost"
 #FORWARD=
 #REVERSE=
-#RECIP_ORIG_HEADER=
-#LOCAL_MAIL_DOMAINS="example.com .allsubdomains.example.com"
-#LOCAL_AUTH_DOMAIN=
-#VIRTUAL_DB=
+#DOMAINS="example.com .allsubdomains.example.com"
 #SRS_SECRETS="secret"
 #EXTRA_ARGS=
 #
@@ -15,8 +12,6 @@
 #
 #SOCKET0="inet:10043@localhost"
 #FORWARD0=1
-#RECIP_ORIG_HEADER0=X-Original-Recipient
-#LOCAL_AUTH_DOMAIN0=example.com
 #SOCKET1="inet:10044@localhost"
-#REVERSE1=
+#REVERSE1=1
 #...

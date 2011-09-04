@@ -39,9 +39,7 @@ static int CONFIG_verbose = 0;
 static int CONFIG_forward = 0;
 static int CONFIG_reverse = 0;
 static char *CONFIG_socket = NULL;
-static char *CONFIG_recip_orig_header = NULL;
-static char **CONFIG_local_mail_domains = NULL;
-static char *CONFIG_local_auth_domain = NULL;
+static char **CONFIG_domains = NULL;
 static char *CONFIG_spf_heloname = NULL;
 static union {
    struct sockaddr_in in;
@@ -63,7 +61,6 @@ struct srs_milter_connection_data {
   char* sender;
   char** envfromargv;
   char** recip;
-  char *recip_orig;
   int recip_remote;
 };
 /* Per-thread data structure. */
@@ -82,22 +79,22 @@ int is_local_addr(const char *addr) {
   if (!addr)
     return 0;
 
-  if (!CONFIG_local_mail_domains)
+  if (!CONFIG_domains)
     return 0;
 
   dom  = strrchr(addr, '@')+1;
   if (!dom)
     dom = addr;
 
-  for (i = 0; CONFIG_local_mail_domains[i]; i++) {
+  for (i = 0; CONFIG_domains[i]; i++) {
 
-    if (strcasecmp(dom, CONFIG_local_mail_domains[i]) == 0) // exact domain name match
+    if (strcasecmp(dom, CONFIG_domains[i]) == 0) // exact domain name match
       return 1;
 
-    if (strlen(dom) <= strlen(CONFIG_local_mail_domains[i]))
+    if (strlen(dom) <= strlen(CONFIG_domains[i]))
       continue;
 
-    if (strcasecmp(dom+strlen(dom)-strlen(CONFIG_local_mail_domains[i]), CONFIG_local_mail_domains[i]) == 0) // match subdomain
+    if (strcasecmp(dom+strlen(dom)-strlen(CONFIG_domains[i]), CONFIG_domains[i]) == 0) // match subdomain
       return 1;
   }
 
@@ -112,11 +109,15 @@ static void srs_milter_thread_data_destructor(void* data) {
 
   struct srs_milter_thread_data* td = (struct srs_milter_thread_data*) data;
 
-  if (td->srs)
+  if (td->srs) {
     srs_free(td->srs);
+    td->srs = NULL;
+  }
 
-  if (td->spf)
+  if (td->spf) {
     SPF_server_free(td->spf);
+    td->spf = NULL;
+  }
 
   free(data);
 }
@@ -139,7 +140,7 @@ xxfi_srs_milter_connect(SMFICTX* ctx, char *hostname, _SOCK_ADDR *hostaddr) {
       return SMFIS_TEMPFAIL;
     }
 
-    bzero(td, sizeof(struct srs_milter_thread_data));
+    memset(td, '\0', sizeof(struct srs_milter_thread_data));
     td->num = ++threads; // this should be done in thread-safe way
 
     if (CONFIG_verbose)
@@ -169,7 +170,7 @@ xxfi_srs_milter_connect(SMFICTX* ctx, char *hostname, _SOCK_ADDR *hostaddr) {
     return SMFIS_TEMPFAIL;
   }
 
-  bzero(cd, sizeof(struct srs_milter_connection_data));
+  memset(cd, '\0', sizeof(struct srs_milter_connection_data));
   cd->state = SS_STATE_NULL;
   cd->num = ++connections; // this should be done in thread-safe way
 
@@ -185,7 +186,8 @@ xxfi_srs_milter_connect(SMFICTX* ctx, char *hostname, _SOCK_ADDR *hostaddr) {
 // https://www.milter.org/developers/api/xxfi_envfrom
 static sfsistat
 xxfi_srs_milter_envfrom(SMFICTX* ctx, char** argv) {
-  struct srs_milter_connection_data* cd = (struct srs_milter_connection_data*) smfi_getpriv(ctx);
+  struct srs_milter_connection_data* cd =
+          (struct srs_milter_connection_data*) smfi_getpriv(ctx);
 
   if (cd->state & SS_STATE_INVALID_CONN)
     return SMFIS_CONTINUE;
@@ -228,11 +230,6 @@ xxfi_srs_milter_envfrom(SMFICTX* ctx, char** argv) {
     cd->recip = NULL;
   }
 
-  if (cd->recip_orig) {
-    free(cd->recip_orig);
-    cd->recip_orig = NULL;
-  }
-
   cd->recip_remote = 0;
 
   // strore MAIL FROM: address
@@ -269,7 +266,8 @@ xxfi_srs_milter_envfrom(SMFICTX* ctx, char** argv) {
 // https://www.milter.org/developers/api/xxfi_envrcpt
 static sfsistat
 xxfi_srs_milter_envrcpt(SMFICTX* ctx, char** argv) {
-  struct srs_milter_connection_data* cd = (struct srs_milter_connection_data*) smfi_getpriv(ctx);
+  struct srs_milter_connection_data* cd =
+          (struct srs_milter_connection_data*) smfi_getpriv(ctx);
 
   if (cd->state & SS_STATE_INVALID_CONN)
     return SMFIS_CONTINUE;
@@ -325,56 +323,11 @@ xxfi_srs_milter_envrcpt(SMFICTX* ctx, char** argv) {
 
 
 
-// https://www.milter.org/developers/api/xxfi_header
-static sfsistat
-xxfi_srs_milter_header(SMFICTX* ctx, char *headerf, char *headerv) {
-  struct srs_milter_connection_data* cd = (struct srs_milter_connection_data*) smfi_getpriv(ctx);
-
-  if (cd->state & (SS_STATE_INVALID_CONN | SS_STATE_INVALID_MSG))
-    return SMFIS_CONTINUE;
-
-  if (!CONFIG_forward)
-    return SMFIS_CONTINUE;
-
-  if (!CONFIG_recip_orig_header || strcasecmp(headerf, CONFIG_recip_orig_header) != 0)
-    return SMFIS_CONTINUE;
-
-  if (CONFIG_verbose)
-    syslog(LOG_DEBUG, "conn# %d[%i] - xxfi_srs_milter_header(\"%s\", \"%s\")",
-           cd->num, cd->state, headerf, headerv);
-
-  // Search for header with original recipient.
-  // This header should be added by some content filter
-  // for all incomming mail (e.g. by modified amavis used
-  // as post-queue content filter).
-  if (CONFIG_recip_orig_header && strcasecmp(headerf, CONFIG_recip_orig_header) == 0 && is_local_addr(headerv)) {
-
-    if (!cd->recip_orig) {
-      cd->recip_orig = strdup(headerv);
-      if (!cd->recip_orig) {
-        // memory allocation problem
-        cd->state |= SS_STATE_INVALID_MSG;
-        return SMFIS_CONTINUE;
-      }
-
-    } else {
-      // TODO: normalize header value before comparison
-      if (strcasecmp(headerv, cd->recip_orig) != 0)
-        syslog(LOG_WARNING, "conn# %d[%i] - xxfi_srs_milter_header(\"%s\", \"%s\"): duplicate %s to %s",
-               cd->num, cd->state, headerf, headerv,
-               CONFIG_recip_orig_header, cd->recip_orig);
-    }
-  }
-
-  return SMFIS_CONTINUE;
-}
-
-
-
 // https://www.milter.org/developers/api/xxfi_eom
 static sfsistat
 xxfi_srs_milter_eom(SMFICTX* ctx) {
-  struct srs_milter_connection_data* cd = (struct srs_milter_connection_data*) smfi_getpriv(ctx);
+  struct srs_milter_connection_data* cd =
+          (struct srs_milter_connection_data*) smfi_getpriv(ctx);
 
   if (cd->state & (SS_STATE_INVALID_CONN | SS_STATE_INVALID_MSG))
     return SMFIS_CONTINUE;
@@ -418,7 +371,7 @@ xxfi_srs_milter_eom(SMFICTX* ctx) {
             syslog(LOG_DEBUG, "conn# %d[%i][%s][%i] - xxfi_srs_milter_eom(): SPF_server_new",
                    cd->num, cd->state, queue_id, td->num);
 
-          if (!(td->spf = SPF_server_new(SPF_DNS_RESOLV, CONFIG_verbose))) {
+          if (!(td->spf = SPF_server_new(SPF_DNS_CACHE, CONFIG_verbose))) {
             syslog(LOG_NOTICE, "conn# %d[%i][%s][%i] - xxfi_srs_milter_eom(): libspf2 error SPF_server_new",
                    cd->num, cd->state, queue_id, td->num);
             break;
@@ -490,39 +443,18 @@ xxfi_srs_milter_eom(SMFICTX* ctx) {
     }
   }
 
-  // use postfix virtual table to guess original recipient name
-  // only in case we have just one recipient
-  // FIXME: cd->recip is not correct!!!
-  //if (fix_envfrom && CONFIG_virtual_db && !cd->recip_orig)
-  //  if (cd->recip && cd->recip[0] && !cd->recip[1])
-  //    cd->recip_orig = db_lookup(cd->recip[0]);
-
-  // try to guess mail address from auth name in case we
-  // was not able to find original recipient in mail headers
-  if (fix_envfrom && CONFIG_local_auth_domain && !cd->recip_orig) {
-    char *auth_authen = smfi_getsymval(ctx, "{auth_authen}");
-    if (auth_authen) {
-      cd->recip_orig = (char *) malloc(strlen(auth_authen) + strlen(CONFIG_local_auth_domain) + 2);
-      if (cd->recip_orig) {
-        // memory allocation problem
-        cd->state |= SS_STATE_INVALID_MSG;
-        return SMFIS_CONTINUE;
-      }
-      sprintf(cd->recip_orig, "%s@%s", auth_authen, CONFIG_local_auth_domain);
-    }
-  }
-
   // debug log gathered data...
   if (CONFIG_verbose) {
-    int i;
-    syslog(LOG_DEBUG, "conn# %d[%i][%s] - xxfi_srs_milter_eom(): forward = %i, reverse = %i, fix_envfrom = %i, recip_remote = %i",
-           cd->num, cd->state, queue_id,
-           CONFIG_forward, CONFIG_reverse, fix_envfrom, cd->recip_remote);
+    int i = 0;
+    syslog(LOG_DEBUG, "conn# %d[%i][%s] - xxfi_srs_milter_eom(): forward = %i, fix_envfrom = %i%s",
+           cd->num, cd->state, queue_id, CONFIG_forward, fix_envfrom,
+           cd->recip_remote ? " (message has remote recipient)" : "");
+    for (i = 0; cd->recip && cd->recip[i]; i++);
+    syslog(LOG_DEBUG, "conn# %d[%i][%s] - xxfi_srs_milter_eom(): reverse = %i, rewrite_count = %i",
+           cd->num, cd->state, queue_id, CONFIG_reverse, i);
     syslog(LOG_DEBUG, "conn# %d[%i][%s] - xxfi_srs_milter_eom(): sender = %s%s",
            cd->num, cd->state, queue_id, cd->sender,
            is_local_addr(cd->sender) ? " (local)" : "");
-    syslog(LOG_DEBUG, "conn# %d[%i][%s] - xxfi_srs_milter_eom(): recip_orig = %s",
-           cd->num, cd->state, queue_id, cd->recip_orig);
     for (i = 0; cd->recip && cd->recip[i]; i++)
       syslog(LOG_DEBUG, "conn# %d[%i][%s] - xxfi_srs_milter_eom(): recip = %s%s",
              cd->num, cd->state, queue_id, cd->recip[i],
@@ -530,7 +462,7 @@ xxfi_srs_milter_eom(SMFICTX* ctx) {
   }
 
   // now, do some SRS magic...
-  if ((fix_envfrom && cd->recip_orig) || (CONFIG_reverse && cd->recip)) {
+  if (fix_envfrom || (CONFIG_reverse && cd->recip)) {
     int i;
     struct srs_milter_thread_data* td;
 
@@ -572,9 +504,9 @@ xxfi_srs_milter_eom(SMFICTX* ctx) {
     int srs_res;
     char *out = NULL;
 
-    if (fix_envfrom && cd->recip_orig) {
+    if (fix_envfrom) {
       // modify MAIL FROM: address to SRS format
-      if ((srs_res = srs_forward_alloc(td->srs, &out, cd->sender, cd->recip_orig)) == SRS_SUCCESS) {
+      if ((srs_res = srs_forward_alloc(td->srs, &out, cd->sender, CONFIG_domains[0])) == SRS_SUCCESS) {
         if (smfi_chgfrom(ctx, out, NULL) != MI_SUCCESS) {
           syslog(LOG_ERR, "conn# %d[%i][%s][%i] - xxfi_srs_milter_eom(): smfi_chgfrom(ctx, %s, NULL) failed",
                  cd->num, cd->state, queue_id, td->num, out);
@@ -585,7 +517,7 @@ xxfi_srs_milter_eom(SMFICTX* ctx) {
         }
       } else {
         syslog(LOG_ERR, "conn# %d[%i][%s][%i] - xxfi_srs_milter_eom(): srs_forward_alloc(srs, out, %s, %s) failed: %i (%s)",
-               cd->num, cd->state, queue_id, td->num, cd->sender, cd->recip_orig, srs_res, srs_strerror(srs_res));
+               cd->num, cd->state, queue_id, td->num, cd->sender, CONFIG_domains[0], srs_res, srs_strerror(srs_res));
       }
 
       if (out)
@@ -626,36 +558,36 @@ xxfi_srs_milter_eom(SMFICTX* ctx) {
 // https://www.milter.org/developers/api/xxfi_close
 static sfsistat
 xxfi_srs_milter_close(SMFICTX* ctx) {
-  struct srs_milter_connection_data* cd = (struct srs_milter_connection_data*) smfi_getpriv(ctx);
+  struct srs_milter_connection_data* cd =
+          (struct srs_milter_connection_data*) smfi_getpriv(ctx);
 
   if (CONFIG_verbose)
-    syslog(LOG_DEBUG, "conn# %d[%i] - xxfi_srs_milter_close()", cd->num, cd->state);
+    syslog(LOG_DEBUG, "conn# %d[%i] - xxfi_srs_milter_close()",
+           cd->num, cd->state);
 
-  if (cd) {
-    int i = 0;
+  if (!cd)
+    return SMFIS_CONTINUE;
 
-    smfi_setpriv(ctx, NULL);
+  smfi_setpriv(ctx, NULL);
 
-    if (cd->sender)
-      free(cd->sender);
+  if (cd->sender)
+    free(cd->sender);
 
-    if (cd->envfromargv) {
-      for (i = 0; cd->envfromargv[i]; i++)
-        free(cd->envfromargv[i]);
-      free(cd->envfromargv);
-    }
-
-    if (cd->recip) {
-      for (i = 0; cd->recip[i]; i++)
-        free(cd->recip[i]);
-      free(cd->recip);
-    }
-
-    if (cd->recip_orig)
-      free(cd->recip_orig);
-
-    free(cd);
+  if (cd->envfromargv) {
+    int i;
+    for (i = 0; cd->envfromargv[i]; i++)
+      free(cd->envfromargv[i]);
+    free(cd->envfromargv);
   }
+
+  if (cd->recip) {
+    int i;
+    for (i = 0; cd->recip[i]; i++)
+      free(cd->recip[i]);
+    free(cd->recip);
+  }
+
+  free(cd);
 
   return SMFIS_CONTINUE;
 }
@@ -671,7 +603,7 @@ static struct smfiDesc smfilter = {
   NULL,				/* SMTP HELO command filter */
   xxfi_srs_milter_envfrom,	/* envelope sender filter */
   xxfi_srs_milter_envrcpt,	/* envelope recipient filter */
-  xxfi_srs_milter_header,	/* header filter */
+  NULL,				/* header filter */
   NULL,				/* end of header */
   NULL,				/* body block filter */
   xxfi_srs_milter_eom,		/* end of message */
@@ -729,10 +661,8 @@ void usage(char *argv0) {
   fprintf(stderr, "SRS milter (version $Id$)\n");
   fprintf(stderr, "usage:\n");
   fprintf(stderr, "  %s --socket unix:/var/run/srs-milter.sock \\\n", argv0);
-  fprintf(stderr, "    --local-recip-header=X-Original-Recipient \\\n");
-  fprintf(stderr, "    --local-mail-domain=example.com \\\n");
-  fprintf(stderr, "    --local-mail-domain=.allsubdomains.example.com \\\n");
-  fprintf(stderr, "    --local-auth-domain=example.com \\\n");
+  fprintf(stderr, "    --domain=example.com \\\n");
+  fprintf(stderr, "    --domain=.allsubdomains.example.com \\\n");
   fprintf(stderr, "    --srs-secret=secret1 --srs-secret=secret2 \\\n");
   fprintf(stderr, "    --debug\n");
   fprintf(stderr, "\n");
@@ -749,22 +679,18 @@ void usage(char *argv0) {
   fprintf(stderr, "      {unix|local}:/path/to/file -- a named pipe.\n");
   fprintf(stderr, "      inet:port@{hostname|ip-address} -- an IPV4 socket.\n");
   fprintf(stderr, "      inet6:port@{hostname|ip-address} -- an IPV6 socket.\n");
+  fprintf(stderr, "  -t, --timeout\n");
+  fprintf(stderr, "      milter timeout\n");
   fprintf(stderr, "  -f, --forward\n");
   fprintf(stderr, "      rewrite MAIL TO: envelope address to SRS for forwarded mail\n");
   fprintf(stderr, "      (non-local sender and recipient + orig_recip in mail header)\n");
   fprintf(stderr, "      (apply this rewriting only on outgoing mails)\n");
   fprintf(stderr, "  -r, --reverse\n");
   fprintf(stderr, "      remove SRS encoding from local RCPT TO: envepope addresses\n");
-//  fprintf(stderr, "      (apply this rewriting only on incomming mails)\n");
-  fprintf(stderr, "  -p, --local-recip-header\n");
-  fprintf(stderr, "      mail header that contain original local recipient address\n");
-  fprintf(stderr, "  -m, --local-mail-domain\n");
+  fprintf(stderr, "  -m, --domain\n");
   fprintf(stderr, "      all local mail domains for that we accept mail\n");
-  fprintf(stderr, "  -u, --local-auth-domain\n");
-  fprintf(stderr, "      in case of missing header with original local recipient address\n");
-  fprintf(stderr, "      we can still build this address for authenticated user using their\n");
-  fprintf(stderr, "      username and this parameter (it assumes that each user has valid\n");
-  fprintf(stderr, "      mail address username@domain)\n");
+  fprintf(stderr, "      starting domain name with \".\" match also all subdomains\n");
+  fprintf(stderr, "      in forward mode first name will be used for SRS rewriting\n");
   fprintf(stderr, "  -l, --spf-heloname\n");
   fprintf(stderr, "      use this heloname for SPF checks (default: gethostname())\n");
   fprintf(stderr, "  -a, --spf-address\n");
@@ -781,15 +707,13 @@ void usage(char *argv0) {
   fprintf(stderr, "example:\n");
   fprintf(stderr, "  %s --forward \\\n", argv0);
   fprintf(stderr, "    --socket=inet:10043@localhost \\\n");
-  fprintf(stderr, "    --local-recip-header=X-CTU-FNSPE-Recip \\\n");
-  fprintf(stderr, "    --local-mail-domain=.fjfi.cvut.cz \\\n");
-  fprintf(stderr, "    --local-mail-domain=.crrc.cvut.cz \\\n");
-  fprintf(stderr, "    --local-auth-domain=fjfi.cvut.cz \\\n");
+  fprintf(stderr, "    --domain=.fjfi.cvut.cz \\\n");
+  fprintf(stderr, "    --domain=.crrc.cvut.cz \\\n");
   fprintf(stderr, "    --srs-secret=secret\n");
   fprintf(stderr, "  %s --reverse \\\n", argv0);
   fprintf(stderr, "    --socket=inet:10044@localhost \\\n");
-  fprintf(stderr, "    --local-mail-domain=.fjfi.cvut.cz \\\n");
-  fprintf(stderr, "    --local-mail-domain=.crrc.cvut.cz \\\n");
+  fprintf(stderr, "    --domain=.fjfi.cvut.cz \\\n");
+  fprintf(stderr, "    --domain=.crrc.cvut.cz \\\n");
   fprintf(stderr, "    --srs-secret=secret\n");
   fprintf(stderr, "\n");
 }
@@ -815,11 +739,10 @@ int main(int argc, char* argv[]) {
       {"verbose",                no_argument,       0, 'v'},
       {"pidfile",                required_argument, 0, 'P'},
       {"socket",                 required_argument, 0, 's'},
+      {"timeout",                required_argument, 0, 't'},
       {"forward",                no_argument,       0, 'f'},
       {"reverse",                no_argument,       0, 'r'},
-      {"local-recip-header",     required_argument, 0, 'p'},
-      {"local-mail-domain",      required_argument, 0, 'm'},
-      {"local-auth-domain",      required_argument, 0, 'u'},
+      {"domain",                 required_argument, 0, 'm'},
       {"spf-heloname",           required_argument, 0, 'l'},
       {"spf-address",            required_argument, 0, 'a'},
       {"srs-always",             no_argument,       0, 'y'},
@@ -834,7 +757,7 @@ int main(int argc, char* argv[]) {
     /* getopt_long stores the option index here. */
     int option_index = 0;
 
-    c = getopt_long(argc, argv, "hdvP:s:f:r:p:m:u:t:l:a:yc:wg:i:x:e:",
+    c = getopt_long(argc, argv, "hdvP:s:t:f:r:m:t:l:a:yc:wg:i:x:e:",
                     long_options, &option_index);
 
     /* Detect the end of the options. */
@@ -875,6 +798,17 @@ int main(int argc, char* argv[]) {
         CONFIG_socket = optarg;
         break;
 
+      case 't':
+        if (optarg == NULL || *optarg == '\0') {
+          fprintf(stderr, "ERROR: illegal timeout %s\n", optarg);
+          exit(EXIT_FAILURE);
+        }
+        if (smfi_settimeout(atoi(optarg)) == MI_FAILURE) {
+          fprintf(stderr, "ERROR: can't set milter timeout %s\n", optarg);
+          exit(EXIT_FAILURE);
+        }
+        break;
+
       case 'f':
         CONFIG_forward = 1;
         break;
@@ -883,24 +817,16 @@ int main(int argc, char* argv[]) {
         CONFIG_reverse = 1;
         break;
 
-      case 'p':
-        CONFIG_recip_orig_header = optarg;
-        break;
-
       case 'm':
         i = 0;
-        if (!CONFIG_local_mail_domains) {
-          CONFIG_local_mail_domains = (char **) malloc((i+2)*sizeof(char *));
+        if (!CONFIG_domains) {
+          CONFIG_domains = (char **) malloc((i+2)*sizeof(char *));
         } else {
-          while (CONFIG_local_mail_domains[i]) i++;
-          CONFIG_local_mail_domains = (char **) realloc(CONFIG_local_mail_domains, (i+2)*sizeof(char *));
+          while (CONFIG_domains[i]) i++;
+          CONFIG_domains = (char **) realloc(CONFIG_domains, (i+2)*sizeof(char *));
         }
-        CONFIG_local_mail_domains[i] = optarg;
-        CONFIG_local_mail_domains[i+1] = NULL;
-        break;
-
-      case 'u':
-        CONFIG_local_auth_domain = optarg;
+        CONFIG_domains[i] = optarg;
+        CONFIG_domains[i+1] = NULL;
         break;
 
       case 'c':
@@ -1008,6 +934,12 @@ int main(int argc, char* argv[]) {
       exit(EXIT_FAILURE);
     }
 
+    if (!CONFIG_domains || !CONFIG_domains[0] || CONFIG_domains[0][0] == '\0') {
+      usage(argv[0]);
+      fprintf(stderr, "ERROR: invalid or missing domain configuration\n");
+      exit(EXIT_FAILURE);
+    }
+
     if (!CONFIG_spf_heloname) {
       CONFIG_spf_heloname = (char *) malloc(64);
       gethostname(CONFIG_spf_heloname, 63);
@@ -1092,12 +1024,8 @@ int main(int argc, char* argv[]) {
         syslog(LOG_DEBUG, "config reverse: %i", CONFIG_reverse);
       if (CONFIG_socket)
         syslog(LOG_DEBUG, "config socket: %s", CONFIG_socket);
-      if (CONFIG_recip_orig_header)
-        syslog(LOG_DEBUG, "config recip_orig_header: %s", CONFIG_recip_orig_header);
-      for (i = 0; CONFIG_local_mail_domains && CONFIG_local_mail_domains[i]; i++)
-        syslog(LOG_DEBUG, "config local_mail_domains: %s", CONFIG_local_mail_domains[i]);
-      if (CONFIG_local_auth_domain)
-        syslog(LOG_DEBUG, "config local_auth_domain: %s", CONFIG_local_auth_domain);
+      for (i = 0; CONFIG_domains && CONFIG_domains[i]; i++)
+        syslog(LOG_DEBUG, "config local_mail_domains: %s", CONFIG_domains[i]);
       if (CONFIG_spf_heloname)
         syslog(LOG_DEBUG, "config spf_heloname: %s", CONFIG_spf_heloname);
       if (CONFIG_spf_address.in.sin_family == AF_INET) {

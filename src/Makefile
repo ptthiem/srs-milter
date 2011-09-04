@@ -1,6 +1,6 @@
 BINDIR =	/usr/sbin
 MANDIR =	/usr/man/man8
-CC =		gcc
+#CC =		gcc
 DEFINES =	
 INCDIRS =	
 LIBDIRS =	

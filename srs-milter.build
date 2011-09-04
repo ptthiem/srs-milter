@@ -1,7 +1,7 @@
 #!/bin/sh
 NAME=srs-milter
 VERSION=0.0.1
-RELEASE=1
+RELEASE=6
 RPMDIR=${HOME}/rpmbuild
 #ARCH=$(uname -i)
 ARCH=i686
@@ -12,14 +12,14 @@ perl -p -i -e "s/^Release: .*/Release: ${RELEASE}/" srs-milter.spec
 
 mkdir -p ${NAME}-${VERSION}
 cp -a \
-src \
 README \
 srs-milter.init \
 srs-milter.sysconfig \
 srs-milter.spec \
 srs-milter-0.0.1-libdir.patch \
 ${NAME}-${VERSION}
-#cp -a src ${NAME}-${VERSION}
+mkdir -p ${NAME}-${VERSION}/src
+cp -a src/Makefile src/*.c ${NAME}-${VERSION}/src
 
 #tar cjf ${NAME}-${VERSION}.tar.bz2 ${NAME}-${VERSION}
 tar czf ${NAME}-${VERSION}.tar.gz ${NAME}-${VERSION}
