@@ -72,6 +72,6 @@ I use this milter on low traffic site (~ 30k mails a day) without problems (curr
 Contributors
 ------------
 
-[vokacpet](http://kmlinux.fjfi.cvut.cz/~vokacpet/) (Original author)
-[emsearcy](https://github.com/emsearcy)
-[Driskell](https://github.com/driskell) <packages at jasonwoods me uk>
+[vokacpet](http://kmlinux.fjfi.cvut.cz/~vokacpet/) (Original author)<br>
+[emsearcy](https://github.com/emsearcy)<br>
+[Driskell](https://github.com/driskell) &lt;packages at jasonwoods me uk&gt;
