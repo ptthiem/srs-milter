@@ -601,9 +601,13 @@ xxfi_srs_milter_close(SMFICTX* ctx) {
   struct srs_milter_connection_data* cd =
           (struct srs_milter_connection_data*) smfi_getpriv(ctx);
 
-  if (CONFIG_verbose)
-    syslog(LOG_DEBUG, "conn# %d[%i] - xxfi_srs_milter_close()",
-           cd->num, cd->state);
+  if (CONFIG_verbose) {
+    if (cd)
+      syslog(LOG_DEBUG, "conn# %d[%i] - xxfi_srs_milter_close()",
+             cd->num, cd->state);
+    else
+      syslog(LOG_DEBUG, "conn# ?[not_connected] - xxfi_srs_milter_close()");
+  }
 
   if (!cd)
     return SMFIS_CONTINUE;
