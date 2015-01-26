@@ -24,7 +24,7 @@
 
 
 #define SRS_MILTER_NAME "srs-milter"
-#define SRS_MILTER_VERSION "0.0.1"
+#define SRS_MILTER_VERSION "0.0.2"
 
 #define SS_STATE_NULL             0x00
 #define SS_STATE_INVALID_CONN     0x01
@@ -73,8 +73,46 @@ struct srs_milter_thread_data {
 
 
 
+char *srs_milter_load_file_secrets(char ***CONFIG_srs_secrets, char *secrets_file) {
+  int i, l;
+  FILE *f;
+  char buffer[1026];
+
+  f = fopen(secrets_file, "r");
+  if (f == NULL)
+    return "ERROR: Failed to open secrets file!\n";
+
+  while (fgets(buffer, 1026, f)) {
+    l = strlen(buffer);
+    if (l == 1 && buffer[0] == '\n')
+      continue;
+
+    if (l == 1026 && buffer[1025] != '\n') {
+      fclose(f);
+      return "ERROR: Line too long in secrets file!\n";
+    }
+
+    if (buffer[l-1] == '\n')
+      buffer[l-1] = 0;
+
+    i = 0;
+    if (!*CONFIG_srs_secrets) {
+      *CONFIG_srs_secrets = (char **) malloc((i+2)*sizeof(char *));
+    } else {
+      while (CONFIG_srs_secrets[i]) i++;
+      *CONFIG_srs_secrets = (char **) realloc(*CONFIG_srs_secrets, (i+2)*sizeof(char *));
+    }
+    (*CONFIG_srs_secrets)[i] = strdup(buffer);
+    (*CONFIG_srs_secrets)[i+1] = NULL;
+  }
+
+  fclose(f);
+
+  return NULL;
+}
+
 int is_local_addr(const char *addr) {
-  int i;
+  int i, r;
   const char *dom;
 
   if (!addr)
@@ -93,12 +131,11 @@ int is_local_addr(const char *addr) {
     if (strcasecmp(dom, CONFIG_domains[i]) == 0)
       return 1;
 
-    if (strlen(dom) <= strlen(CONFIG_domains[i]))
-      continue;
-
     // match subdomain
-    if (strcasecmp(dom+strlen(dom)-strlen(CONFIG_domains[i]), CONFIG_domains[i]) == 0)
+    r = strlen(dom) - strlen(CONFIG_domains[i]);
+    if (r > 0 && CONFIG_domains[i][0] == '.' && strcasecmp(dom + r, CONFIG_domains[i]) == 0)
       return 1;
+
   }
 
   return 0;
@@ -564,9 +601,13 @@ xxfi_srs_milter_close(SMFICTX* ctx) {
   struct srs_milter_connection_data* cd =
           (struct srs_milter_connection_data*) smfi_getpriv(ctx);
 
-  if (CONFIG_verbose)
-    syslog(LOG_DEBUG, "conn# %d[%i] - xxfi_srs_milter_close()",
-           cd->num, cd->state);
+  if (CONFIG_verbose) {
+    if (cd)
+      syslog(LOG_DEBUG, "conn# %d[%i] - xxfi_srs_milter_close()",
+             cd->num, cd->state);
+    else
+      syslog(LOG_DEBUG, "conn# ?[not_connected] - xxfi_srs_milter_close()");
+  }
 
   if (!cd)
     return SMFIS_CONTINUE;
@@ -599,19 +640,19 @@ xxfi_srs_milter_close(SMFICTX* ctx) {
 
 
 static struct smfiDesc smfilter = {
-  SRS_MILTER_NAME,		/* filter name */
-  SMFI_VERSION,			/* version code -- do not change */
-  SMFIF_CHGFROM | SMFIF_ADDRCPT | SMFIF_DELRCPT ,	/* flags */
-  xxfi_srs_milter_connect,	/* connection info filter */
-  NULL,				/* SMTP HELO command filter */
-  xxfi_srs_milter_envfrom,	/* envelope sender filter */
-  xxfi_srs_milter_envrcpt,	/* envelope recipient filter */
-  NULL,				/* header filter */
-  NULL,				/* end of header */
-  NULL,				/* body block filter */
-  xxfi_srs_milter_eom,		/* end of message */
-  NULL,				/* message aborted */
-  xxfi_srs_milter_close		/* connection cleanup */
+  SRS_MILTER_NAME,              /* filter name */
+  SMFI_VERSION,                 /* version code -- do not change */
+  SMFIF_CHGFROM | SMFIF_ADDRCPT | SMFIF_DELRCPT, /* flags */
+  xxfi_srs_milter_connect,      /* connection info filter */
+  NULL,                         /* SMTP HELO command filter */
+  xxfi_srs_milter_envfrom,      /* envelope sender filter */
+  xxfi_srs_milter_envrcpt,      /* envelope recipient filter */
+  NULL,                         /* header filter */
+  NULL,                         /* end of header */
+  NULL,                         /* body block filter */
+  xxfi_srs_milter_eom,          /* end of message */
+  NULL,                         /* message aborted */
+  xxfi_srs_milter_close         /* connection cleanup */
 };
 
 
@@ -661,68 +702,56 @@ void daemonize() {
 
 
 void usage(char *argv0) {
-  fprintf(stderr, "SRS milter (version $Id: srs-filter.c 1126 2011-09-04 19:53:19Z vokac $)\n");
-  fprintf(stderr, "usage:\n");
-  fprintf(stderr, "  %s --socket unix:/var/run/srs-milter.sock \\\n", argv0);
-  fprintf(stderr, "    --domain=example.com \\\n");
-  fprintf(stderr, "    --domain=.allsubdomains.example.com \\\n");
-  fprintf(stderr, "    --srs-secret=secret1 --srs-secret=secret2 \\\n");
-  fprintf(stderr, "    --debug\n");
-  fprintf(stderr, "\n");
-  fprintf(stderr, "options:\n");
-  fprintf(stderr, "  -h, --help\n");
-  fprintf(stderr, "      this help message\n");
-  fprintf(stderr, "  -d, --debug\n");
-  fprintf(stderr, "      don't daemonize this process\n");
-  fprintf(stderr, "  -v, --verbose\n");
-  fprintf(stderr, "      verbose output\n");
-  fprintf(stderr, "  -P, --pidfile\n");
-  fprintf(stderr, "      filename where to store process PID\n");
-  fprintf(stderr, "  -s, --socket\n");
-  fprintf(stderr, "      {unix|local}:/path/to/file -- a named pipe.\n");
-  fprintf(stderr, "      inet:port@{hostname|ip-address} -- an IPV4 socket.\n");
-  fprintf(stderr, "      inet6:port@{hostname|ip-address} -- an IPV6 socket.\n");
-  fprintf(stderr, "  -t, --timeout\n");
-  fprintf(stderr, "      milter timeout\n");
-  fprintf(stderr, "  -f, --forward\n");
-  fprintf(stderr, "      rewrite MAIL TO: envelope address to SRS for forwarded mail\n");
-  fprintf(stderr, "      (non-local sender and recipient + orig_recip in mail header)\n");
-  fprintf(stderr, "      (apply this rewriting only on outgoing mails)\n");
-  fprintf(stderr, "  -r, --reverse\n");
-  fprintf(stderr, "      remove SRS encoding from local RCPT TO: envepope addresses\n");
-  fprintf(stderr, "  -m, --domain\n");
-  fprintf(stderr, "      all local mail domains for that we accept mail\n");
-  fprintf(stderr, "      starting domain name with \".\" match also all subdomains\n");
-  fprintf(stderr, "  -o, --srs-domain\n");
-  fprintf(stderr, "      local SRS domain name\n");
-  fprintf(stderr, "  -c, --srs-secret\n");
-  fprintf(stderr, "      secret string for SRS hashing algorithm\n");
-  fprintf(stderr, "  -w, --srs-alwaysrewrite\n");
-  fprintf(stderr, "  -g, --srs-hashlength\n");
-  fprintf(stderr, "  -i, --srs-hashmin\n");
-  fprintf(stderr, "  -x, --srs-maxage\n");
-  fprintf(stderr, "  -e, --srs-separator\n");
-  fprintf(stderr, "      separator of the SRS address part (you can use '+', '-', '=')\n");
-  fprintf(stderr, "  -c, --spf-check\n");
-  fprintf(stderr, "      use SRS only on mail failing SPF checks\n");
-  fprintf(stderr, "  -l, --spf-heloname\n");
-  fprintf(stderr, "      use this heloname for SPF checks (default: gethostname())\n");
-  fprintf(stderr, "  -a, --spf-address\n");
-  fprintf(stderr, "      use this address for SPF checks (default: gethostaddr())\n");
-  fprintf(stderr, "\n");
-  fprintf(stderr, "example:\n");
-  fprintf(stderr, "  %s --forward \\\n", argv0);
-  fprintf(stderr, "    --socket=inet:10043@localhost \\\n");
-  fprintf(stderr, "    --local-domain=example.com \\\n");
-  fprintf(stderr, "    --local-domain=.subdomains.example.com \\\n");
-  fprintf(stderr, "    --srs-domain=srs.example.com \\\n");
-  fprintf(stderr, "    --srs-secret=secret \\\n");
-  fprintf(stderr, "    --spf-check\n");
-  fprintf(stderr, "  %s --reverse \\\n", argv0);
-  fprintf(stderr, "    --socket=inet:10044@localhost \\\n");
-  fprintf(stderr, "    --srs-domain=srs.example.com \\\n");
-  fprintf(stderr, "    --srs-secret=secret\n");
-  fprintf(stderr, "\n");
+  printf("SRS milter (version %s)\n", SRS_MILTER_VERSION);
+  printf("usage:\n");
+  printf("  %s [--forward] [--reverse] \\\n", argv0);
+  printf("    --socket unix:/var/run/srs-milter.sock \\\n");
+  printf("    --srs-domain=example.com --srs-secret-file=secret-file \\\n");
+  printf("    [--domain=example.com] [--domain=.example.com ...]\n");
+  printf("\n");
+  printf("options:\n");
+  printf("  -h, --help\n");
+  printf("      this help message\n");
+  printf("  -d, --debug\n");
+  printf("      don't daemonize this process\n");
+  printf("  -v, --verbose\n");
+  printf("      verbose output\n");
+  printf("  -P, --pidfile\n");
+  printf("      filename where to store process PID\n");
+  printf("  -s, --socket\n");
+  printf("      {unix|local}:/path/to/file -- a named pipe.\n");
+  printf("      inet:port@{hostname|ip-address} -- an IPV4 socket.\n");
+  printf("      inet6:port@{hostname|ip-address} -- an IPV6 socket.\n");
+  printf("  -t, --timeout\n");
+  printf("      milter timeout\n");
+  printf("  -f, --forward\n");
+  printf("      SRS encode the envelope sender of non-local-destined mail\n");
+  printf("  -r, --reverse\n");
+  printf("      SRS decode any envelope recipients of local SRS addresses\n");
+  printf("  -m, --domain\n");
+  printf("      all local mail domains for that we accept mail\n");
+  printf("      starting domain name with \".\" match also all subdomains\n");
+  printf("  -o, --srs-domain\n");
+  printf("      our SRS domain name\n");
+  printf("  -c, --srs-secret\n");
+  printf("      secret string for SRS hashing algorithm\n");
+  printf("      WARNING: this is NOT secure, it is recommended to use --srs-secret-file\n");
+  printf("               instead to ensure secrets are not visible in process listings\n");
+  printf("  -C, --srs-secret-file\n");
+  printf("      file containing secrets for SRS hashing algorithm\n");
+  printf("  -w, --srs-alwaysrewrite\n");
+  printf("  -g, --srs-hashlength\n");
+  printf("  -i, --srs-hashmin\n");
+  printf("  -x, --srs-maxage\n");
+  printf("  -e, --srs-separator\n");
+  printf("      SRS address separator, must be one of '+' '-' '=' (default: libsrs2 default)\n");
+  printf("  -c, --spf-check\n");
+  printf("      use SRS only when sender's SPF record will (soft)fail us\n");
+  printf("  -l, --spf-heloname\n");
+  printf("      use this heloname for SPF checks (default: gethostname())\n");
+  printf("  -a, --spf-address\n");
+  printf("      use this address for SPF checks (default: gethostaddr())\n");
+  printf("\n");
 }
 
 
@@ -756,6 +785,7 @@ int main(int argc, char* argv[]) {
       {"srs-domain",             required_argument, 0, 'o'},
       {"srs-always",             no_argument,       0, 'y'},
       {"srs-secret",             required_argument, 0, 'c'},
+      {"srs-secret-file",        required_argument, 0, 'C'},
       {"srs-alwaysrewrite",      no_argument,       0, 'w'},
       {"srs-hashlength",         required_argument, 0, 'g'},
       {"srs-hashmin",            required_argument, 0, 'i'},
@@ -766,7 +796,7 @@ int main(int argc, char* argv[]) {
     /* getopt_long stores the option index here. */
     int option_index = 0;
 
-    c = getopt_long(argc, argv, "hdvP:s:t:f:r:mk:t:l:a:o:yc:wg:i:x:e:",
+    c = getopt_long(argc, argv, "hdvP:s:t:f:r:mk:t:l:a:o:yc:C:wg:i:x:e:",
                     long_options, &option_index);
 
     /* Detect the end of the options. */
@@ -850,8 +880,19 @@ int main(int argc, char* argv[]) {
           while (CONFIG_srs_secrets[i]) i++;
           CONFIG_srs_secrets = (char **) realloc(CONFIG_srs_secrets, (i+2)*sizeof(char *));
         }
-        CONFIG_srs_secrets[i] = optarg;
+        CONFIG_srs_secrets[i] = strdup(optarg); // We free secrets on exit because some may be allocated from a file
         CONFIG_srs_secrets[i+1] = NULL;
+        break;
+
+      case 'C':
+        {
+          char *err = srs_milter_load_file_secrets(&CONFIG_srs_secrets, optarg);
+          if (err) {
+            usage(argv[0]);
+            fprintf(stderr, err);
+            exit(EXIT_FAILURE);
+          }
+        }
         break;
 
       case 'l':
@@ -1097,6 +1138,14 @@ int main(int argc, char* argv[]) {
   if (smfi_main() == MI_FAILURE) {
     fprintf(stderr, "%s: milter failed\n", SRS_MILTER_NAME);
     exit(EXIT_FAILURE);
+  }
+
+  // Free the secrets
+  {
+    char **s = CONFIG_srs_secrets;
+    do {
+      free(*s);
+    } while (*++s != NULL);
   }
 
   syslog(LOG_INFO, "exitting");
