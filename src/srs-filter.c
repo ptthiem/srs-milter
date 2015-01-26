@@ -40,12 +40,13 @@ static int CONFIG_forward = 0;
 static int CONFIG_reverse = 0;
 static char *CONFIG_socket = NULL;
 static char **CONFIG_domains = NULL;
+static int CONFIG_spf_check = 0;
 static char *CONFIG_spf_heloname = NULL;
 static union {
    struct sockaddr_in in;
    struct sockaddr_in6 in6;
 } CONFIG_spf_address;
-static int CONFIG_srs_always = 0;
+static char *CONFIG_srs_domain = NULL;
 static char **CONFIG_srs_secrets = NULL;
 static int CONFIG_srs_alwaysrewrite = 0;
 static int CONFIG_srs_hashlength = 0;
@@ -88,13 +89,15 @@ int is_local_addr(const char *addr) {
 
   for (i = 0; CONFIG_domains[i]; i++) {
 
-    if (strcasecmp(dom, CONFIG_domains[i]) == 0) // exact domain name match
+    // exact domain name match
+    if (strcasecmp(dom, CONFIG_domains[i]) == 0)
       return 1;
 
     if (strlen(dom) <= strlen(CONFIG_domains[i]))
       continue;
 
-    if (strcasecmp(dom+strlen(dom)-strlen(CONFIG_domains[i]), CONFIG_domains[i]) == 0) // match subdomain
+    // match subdomain
+    if (strcasecmp(dom+strlen(dom)-strlen(CONFIG_domains[i]), CONFIG_domains[i]) == 0)
       return 1;
   }
 
@@ -345,7 +348,7 @@ xxfi_srs_milter_eom(SMFICTX* ctx) {
   // for this particular sender domain
   if (CONFIG_forward && !is_local_addr(cd->sender) && cd->recip_remote) {
 
-    if (CONFIG_srs_always) {
+    if (CONFIG_srs_alwaysrewrite || !CONFIG_spf_check) {
 
       fix_envfrom = 1;
 
@@ -506,7 +509,7 @@ xxfi_srs_milter_eom(SMFICTX* ctx) {
 
     if (fix_envfrom) {
       // modify MAIL FROM: address to SRS format
-      if ((srs_res = srs_forward_alloc(td->srs, &out, cd->sender, CONFIG_domains[0])) == SRS_SUCCESS) {
+      if ((srs_res = srs_forward_alloc(td->srs, &out, cd->sender, CONFIG_srs_domain)) == SRS_SUCCESS) {
         if (smfi_chgfrom(ctx, out, NULL) != MI_SUCCESS) {
           syslog(LOG_ERR, "conn# %d[%i][%s][%i] - xxfi_srs_milter_eom(): smfi_chgfrom(ctx, %s, NULL) failed",
                  cd->num, cd->state, queue_id, td->num, out);
@@ -517,7 +520,7 @@ xxfi_srs_milter_eom(SMFICTX* ctx) {
         }
       } else {
         syslog(LOG_ERR, "conn# %d[%i][%s][%i] - xxfi_srs_milter_eom(): srs_forward_alloc(srs, out, %s, %s) failed: %i (%s)",
-               cd->num, cd->state, queue_id, td->num, cd->sender, CONFIG_domains[0], srs_res, srs_strerror(srs_res));
+               cd->num, cd->state, queue_id, td->num, cd->sender, CONFIG_srs_domain, srs_res, srs_strerror(srs_res));
       }
 
       if (out)
@@ -658,7 +661,7 @@ void daemonize() {
 
 
 void usage(char *argv0) {
-  fprintf(stderr, "SRS milter (version $Id$)\n");
+  fprintf(stderr, "SRS milter (version $Id: srs-filter.c 1126 2011-09-04 19:53:19Z vokac $)\n");
   fprintf(stderr, "usage:\n");
   fprintf(stderr, "  %s --socket unix:/var/run/srs-milter.sock \\\n", argv0);
   fprintf(stderr, "    --domain=example.com \\\n");
@@ -690,11 +693,8 @@ void usage(char *argv0) {
   fprintf(stderr, "  -m, --domain\n");
   fprintf(stderr, "      all local mail domains for that we accept mail\n");
   fprintf(stderr, "      starting domain name with \".\" match also all subdomains\n");
-  fprintf(stderr, "      in forward mode first name will be used for SRS rewriting\n");
-  fprintf(stderr, "  -l, --spf-heloname\n");
-  fprintf(stderr, "      use this heloname for SPF checks (default: gethostname())\n");
-  fprintf(stderr, "  -a, --spf-address\n");
-  fprintf(stderr, "      use this address for SPF checks (default: gethostaddr())\n");
+  fprintf(stderr, "  -o, --srs-domain\n");
+  fprintf(stderr, "      local SRS domain name\n");
   fprintf(stderr, "  -c, --srs-secret\n");
   fprintf(stderr, "      secret string for SRS hashing algorithm\n");
   fprintf(stderr, "  -w, --srs-alwaysrewrite\n");
@@ -703,17 +703,24 @@ void usage(char *argv0) {
   fprintf(stderr, "  -x, --srs-maxage\n");
   fprintf(stderr, "  -e, --srs-separator\n");
   fprintf(stderr, "      separator of the SRS address part (you can use '+', '-', '=')\n");
+  fprintf(stderr, "  -c, --spf-check\n");
+  fprintf(stderr, "      use SRS only on mail failing SPF checks\n");
+  fprintf(stderr, "  -l, --spf-heloname\n");
+  fprintf(stderr, "      use this heloname for SPF checks (default: gethostname())\n");
+  fprintf(stderr, "  -a, --spf-address\n");
+  fprintf(stderr, "      use this address for SPF checks (default: gethostaddr())\n");
   fprintf(stderr, "\n");
   fprintf(stderr, "example:\n");
   fprintf(stderr, "  %s --forward \\\n", argv0);
   fprintf(stderr, "    --socket=inet:10043@localhost \\\n");
-  fprintf(stderr, "    --domain=.fjfi.cvut.cz \\\n");
-  fprintf(stderr, "    --domain=.crrc.cvut.cz \\\n");
-  fprintf(stderr, "    --srs-secret=secret\n");
+  fprintf(stderr, "    --local-domain=example.com \\\n");
+  fprintf(stderr, "    --local-domain=.subdomains.example.com \\\n");
+  fprintf(stderr, "    --srs-domain=srs.example.com \\\n");
+  fprintf(stderr, "    --srs-secret=secret \\\n");
+  fprintf(stderr, "    --spf-check\n");
   fprintf(stderr, "  %s --reverse \\\n", argv0);
   fprintf(stderr, "    --socket=inet:10044@localhost \\\n");
-  fprintf(stderr, "    --domain=.fjfi.cvut.cz \\\n");
-  fprintf(stderr, "    --domain=.crrc.cvut.cz \\\n");
+  fprintf(stderr, "    --srs-domain=srs.example.com \\\n");
   fprintf(stderr, "    --srs-secret=secret\n");
   fprintf(stderr, "\n");
 }
@@ -742,9 +749,11 @@ int main(int argc, char* argv[]) {
       {"timeout",                required_argument, 0, 't'},
       {"forward",                no_argument,       0, 'f'},
       {"reverse",                no_argument,       0, 'r'},
-      {"domain",                 required_argument, 0, 'm'},
+      {"local-domain",           required_argument, 0, 'm'},
+      {"spf-check",              no_argument,       0, 'k'},
       {"spf-heloname",           required_argument, 0, 'l'},
       {"spf-address",            required_argument, 0, 'a'},
+      {"srs-domain",             required_argument, 0, 'o'},
       {"srs-always",             no_argument,       0, 'y'},
       {"srs-secret",             required_argument, 0, 'c'},
       {"srs-alwaysrewrite",      no_argument,       0, 'w'},
@@ -757,7 +766,7 @@ int main(int argc, char* argv[]) {
     /* getopt_long stores the option index here. */
     int option_index = 0;
 
-    c = getopt_long(argc, argv, "hdvP:s:t:f:r:m:t:l:a:yc:wg:i:x:e:",
+    c = getopt_long(argc, argv, "hdvP:s:t:f:r:mk:t:l:a:o:yc:wg:i:x:e:",
                     long_options, &option_index);
 
     /* Detect the end of the options. */
@@ -829,6 +838,10 @@ int main(int argc, char* argv[]) {
         CONFIG_domains[i+1] = NULL;
         break;
 
+      case 'k':
+        CONFIG_spf_check = 1;
+        break;
+
       case 'c':
         i = 0;
         if (!CONFIG_srs_secrets) {
@@ -849,8 +862,10 @@ int main(int argc, char* argv[]) {
         address = optarg;
         break;
 
-      case 'y':
-        CONFIG_srs_always = 1;
+      case 'o':
+        if (CONFIG_srs_domain)
+          free(CONFIG_srs_domain);
+        CONFIG_srs_domain = strdup(optarg);
         break;
 
       case 'w':
@@ -904,6 +919,11 @@ int main(int argc, char* argv[]) {
       strncat(args, argv[i], 1023);
     }
     syslog(LOG_NOTICE, "Starting %s v%s (args:%s)", SRS_MILTER_NAME, SRS_MILTER_VERSION, args);
+
+    SPF_error_handler = SPF_error_syslog;
+    SPF_warning_handler = SPF_warning_syslog;
+    SPF_info_handler = SPF_info_syslog;
+    SPF_debug_handler = SPF_debug_syslog;
   }
 
   // print and validate configuration
@@ -934,48 +954,52 @@ int main(int argc, char* argv[]) {
       exit(EXIT_FAILURE);
     }
 
-    if (!CONFIG_domains || !CONFIG_domains[0] || CONFIG_domains[0][0] == '\0') {
+    if (!CONFIG_srs_domain || strlen(CONFIG_srs_domain) == 0) {
       usage(argv[0]);
-      fprintf(stderr, "ERROR: invalid or missing domain configuration\n");
+      fprintf(stderr, "ERROR: invalid or missing srs domain configuration\n");
       exit(EXIT_FAILURE);
     }
 
-    if (!CONFIG_spf_heloname) {
-      CONFIG_spf_heloname = (char *) malloc(64);
-      gethostname(CONFIG_spf_heloname, 63);
-    }
+    if (CONFIG_spf_check) {
 
-    if (address) {
-      if (inet_pton(AF_INET, address, &CONFIG_spf_address) <= 0)
-        if (inet_pton(AF_INET6, address, &CONFIG_spf_address) <= 0) {
-          usage(argv[0]);
-          fprintf(stderr, "ERROR: invalid SPF address %s\n", address);
-          exit(EXIT_FAILURE);
-        }
-    } else {
-      // get local address
-      struct ifaddrs *ifAddrStruct = NULL;
-      struct ifaddrs *ifa = NULL;
-
-      getifaddrs(&ifAddrStruct);
-
-      for (ifa = ifAddrStruct; ifa != NULL; ifa = ifa->ifa_next) {
-        if (!ifa->ifa_addr)
-          continue;
-        if(ifa->ifa_flags & IFF_LOOPBACK)
-          continue;
-        if(ifa->ifa_flags & IFF_POINTOPOINT)
-          continue;
-        if (ifa->ifa_addr->sa_family == AF_INET) { // check it is IP4
-          memcpy(&CONFIG_spf_address.in, ifa->ifa_addr, sizeof(struct sockaddr_in));
-          break;
-//        } else if (ifa->ifa_addr->sa_family == AF_INET6) { // check it is IP6
-//          memcpy(&CONFIG_spf_address.in6, ifa->ifa_addr, sizeof(struct sockaddr_in6));
-        }
+      if (!CONFIG_spf_heloname) {
+        CONFIG_spf_heloname = (char *) malloc(64);
+        gethostname(CONFIG_spf_heloname, 63);
       }
 
-      if (ifAddrStruct!=NULL)
-        freeifaddrs(ifAddrStruct);
+      if (address) {
+        if (inet_pton(AF_INET, address, &CONFIG_spf_address) <= 0)
+          if (inet_pton(AF_INET6, address, &CONFIG_spf_address) <= 0) {
+            usage(argv[0]);
+            fprintf(stderr, "ERROR: invalid SPF address %s\n", address);
+            exit(EXIT_FAILURE);
+          }
+      } else {
+
+        // get local address
+        struct ifaddrs *ifAddrStruct = NULL;
+        struct ifaddrs *ifa = NULL;
+
+        getifaddrs(&ifAddrStruct);
+
+        for (ifa = ifAddrStruct; ifa != NULL; ifa = ifa->ifa_next) {
+         if (!ifa->ifa_addr)
+            continue;
+          if(ifa->ifa_flags & IFF_LOOPBACK)
+            continue;
+          if(ifa->ifa_flags & IFF_POINTOPOINT)
+            continue;
+          if (ifa->ifa_addr->sa_family == AF_INET) { // check it is IP4
+            memcpy(&CONFIG_spf_address.in, ifa->ifa_addr, sizeof(struct sockaddr_in));
+            break;
+//          } else if (ifa->ifa_addr->sa_family == AF_INET6) { // check it is IP6
+//            memcpy(&CONFIG_spf_address.in6, ifa->ifa_addr, sizeof(struct sockaddr_in6));
+          }
+        }
+
+        if (ifAddrStruct!=NULL)
+          freeifaddrs(ifAddrStruct);
+      }
     }
 
     if (!CONFIG_srs_secrets || !CONFIG_srs_secrets[0]) {
@@ -1026,17 +1050,8 @@ int main(int argc, char* argv[]) {
         syslog(LOG_DEBUG, "config socket: %s", CONFIG_socket);
       for (i = 0; CONFIG_domains && CONFIG_domains[i]; i++)
         syslog(LOG_DEBUG, "config local_mail_domains: %s", CONFIG_domains[i]);
-      if (CONFIG_spf_heloname)
-        syslog(LOG_DEBUG, "config spf_heloname: %s", CONFIG_spf_heloname);
-      if (CONFIG_spf_address.in.sin_family == AF_INET) {
-        char host[INET_ADDRSTRLEN+1];
-        inet_ntop(AF_INET, &CONFIG_spf_address.in.sin_addr, host, INET_ADDRSTRLEN);
-        syslog(LOG_DEBUG, "config spf_address: %s (IP)", host);
-      } else {
-        char host[INET_ADDRSTRLEN+1];
-        inet_ntop(AF_INET6, &CONFIG_spf_address.in6.sin6_addr, host, INET_ADDRSTRLEN);
-        syslog(LOG_DEBUG, "config spf_address: %s (IPv6)", host);
-      }
+      if (CONFIG_srs_domain)
+        syslog(LOG_DEBUG, "config srs_domain: %s", CONFIG_srs_domain);
       for (i = 0; CONFIG_srs_secrets && CONFIG_srs_secrets[i]; i++)
         syslog(LOG_DEBUG, "config srs_secrets: %s", CONFIG_srs_secrets[i]);
       if (CONFIG_srs_alwaysrewrite > 0)
@@ -1049,6 +1064,20 @@ int main(int argc, char* argv[]) {
         syslog(LOG_DEBUG, "config srs_maxage: %i", CONFIG_srs_maxage);
       if (CONFIG_srs_separator != 0)
         syslog(LOG_DEBUG, "config srs_separator: %c", CONFIG_srs_separator);
+      syslog(LOG_DEBUG, "config spf_check: %i", CONFIG_spf_check);
+      if (CONFIG_spf_check) {
+        if (CONFIG_spf_heloname)
+          syslog(LOG_DEBUG, "config spf_heloname: %s", CONFIG_spf_heloname);
+        if (CONFIG_spf_address.in.sin_family == AF_INET) {
+          char host[INET_ADDRSTRLEN+1];
+          inet_ntop(AF_INET, &CONFIG_spf_address.in.sin_addr, host, INET_ADDRSTRLEN);
+          syslog(LOG_DEBUG, "config spf_address: %s (IP)", host);
+        } else {
+          char host[INET_ADDRSTRLEN+1];
+          inet_ntop(AF_INET6, &CONFIG_spf_address.in6.sin6_addr, host, INET_ADDRSTRLEN);
+          syslog(LOG_DEBUG, "config spf_address: %s (IPv6)", host);
+        }
+      }
     }
   }
 
