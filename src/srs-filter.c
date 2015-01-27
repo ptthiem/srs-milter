@@ -30,6 +30,8 @@
 #define SS_STATE_INVALID_CONN     0x01
 #define SS_STATE_INVALID_MSG      0x02
 
+#define MAXBUF 1024
+
 /* Global variables */
 static pthread_key_t key;
 static int connections = 0;
@@ -38,9 +40,11 @@ static int threads = 0;
 /* these should be read from command line or config file */
 typedef struct {
   int verbose;
+  char *pidfile;
   int forward;
   int reverse;
   char *socket;
+  int timeout;
   char **domains;
   int spf_check;
   char *spf_heloname;
@@ -48,6 +52,7 @@ typedef struct {
     struct sockaddr_in in;
     struct sockaddr_in6 in6;
   } spf_address;
+  int spf_address_defined;
   char *srs_domain;
   char **srs_secrets;
   int srs_alwaysrewrite;
@@ -78,42 +83,169 @@ struct srs_milter_thread_data {
 
 
 
-char *srs_milter_load_file_secrets(char ***CONFIG_srs_secrets, char *secrets_file) {
-  int i, l;
-  FILE *f;
-  char buffer[1026];
-
-  f = fopen(secrets_file, "r");
-  if (f == NULL)
-    return "ERROR: Failed to open secrets file!\n";
-
-  while (fgets(buffer, 1026, f)) {
-    l = strlen(buffer);
-    if (l == 1 && buffer[0] == '\n')
-      continue;
-
-    if (l == 1026 && buffer[1025] != '\n') {
-      fclose(f);
-      return "ERROR: Line too long in secrets file!\n";
+int srs_milter_configure(const char *key, const char *val) {
+#define CHECK_VALUE(key) \
+    if (val == NULL || *val == '\0') { \
+      fprintf(stderr, "ERROR: missing %s value\n", key); \
+      return 1; \
     }
 
-    if (buffer[l-1] == '\n')
-      buffer[l-1] = 0;
+  if (strcmp(key, "verbose") == 0) {
+    config.verbose = 1;
 
-    i = 0;
-    if (!*CONFIG_srs_secrets) {
-      *CONFIG_srs_secrets = (char **) malloc((i+2)*sizeof(char *));
+  } else if (strcmp(key, "pidfile") == 0) {
+    CHECK_VALUE(key);
+
+    if (config.pidfile)
+      free(config.pidfile);
+    config.pidfile = strdup(val);
+
+  } else if (strcmp(key, "socket") == 0) {
+    CHECK_VALUE(key);
+
+    if (config.socket)
+      free(config.socket);
+    config.socket = strdup(val);
+
+  } else if (strcmp(key, "timeout") == 0) {
+    CHECK_VALUE(key);
+
+    config.timeout = atoi(val);
+
+  } else if (strcmp(key, "forward") == 0) {
+    config.forward = 1;
+
+  } else if (strcmp(key, "reverse") == 0) {
+    config.reverse = 1;
+
+  } else if (strcmp(key, "local-domain") == 0) {
+    CHECK_VALUE(key);
+
+    int i = 0;
+    if (!config.domains) {
+      config.domains = (char **) malloc((i+2)*sizeof(char *));
     } else {
-      while (CONFIG_srs_secrets[i]) i++;
-      *CONFIG_srs_secrets = (char **) realloc(*CONFIG_srs_secrets, (i+2)*sizeof(char *));
+      while (config.domains[i]) i++;
+      config.domains = (char **) realloc(config.domains, (i+2)*sizeof(char *));
     }
-    (*CONFIG_srs_secrets)[i] = strdup(buffer);
-    (*CONFIG_srs_secrets)[i+1] = NULL;
+    config.domains[i] = strdup(val);
+    config.domains[i+1] = NULL;
+
+  } else if (strcmp(key, "srs-domain") == 0) {
+    CHECK_VALUE(key);
+
+    if (config.srs_domain)
+      free(config.srs_domain);
+    config.srs_domain = strdup(val);
+
+  } else if (strcmp(key, "srs-secret") == 0) {
+    CHECK_VALUE(key);
+
+    int i = 0;
+    if (!config.srs_secrets) {
+      config.srs_secrets = (char **) malloc((i+2)*sizeof(char *));
+    } else {
+      while (config.srs_secrets[i]) i++;
+      config.srs_secrets = (char **) realloc(config.srs_secrets, (i+2)*sizeof(char *));
+    }
+    config.srs_secrets[i] = strdup(val);
+    config.srs_secrets[i+1] = NULL;
+
+  } else if (strcmp(key, "srs-alwaysrewrite") == 0) {
+    config.srs_alwaysrewrite = 1;
+
+  } else if (strcmp(key, "srs-hashlength") == 0) {
+    CHECK_VALUE(key);
+
+    config.srs_hashlength = atoi(val);
+
+  } else if (strcmp(key, "srs-hashmin") == 0) {
+    CHECK_VALUE(key);
+
+    config.srs_hashmin = atoi(val);
+
+  } else if (strcmp(key, "srs-maxage") == 0) {
+    CHECK_VALUE(key);
+
+    config.srs_maxage = atoi(val);
+
+  } else if (strcmp(key, "srs-separator") == 0) {
+    CHECK_VALUE(key);
+
+    config.srs_separator = val[0];
+
+  } else if (strcmp(key, "spf-check") == 0) {
+    config.spf_check = 1;
+
+  } else if (strcmp(key, "spf-heloname") == 0) {
+    CHECK_VALUE(key);
+
+    if (config.spf_heloname)
+      free(config.spf_heloname);
+    config.spf_heloname = strdup(val);
+
+  } else if (strcmp(key, "spf-address") == 0) {
+    CHECK_VALUE(key);
+
+    if (inet_pton(AF_INET, val, &config.spf_address) <= 0)
+      if (inet_pton(AF_INET6, val, &config.spf_address) <= 0) {
+        fprintf(stderr, "ERROR: invalid SPF address %s\n", val);
+        return 1;
+      }
+
+    config.spf_address_defined = 1;
+
+  } else {
+    fprintf(stderr, "WARN: unknown argument %s='%s'\n", key, val);
+
   }
 
-  fclose(f);
+  return 0;
+}
 
-  return NULL;
+int srs_milter_load_config(const char *filename) {
+  char line[MAXBUF];
+  int ret = 0;
+
+  FILE *file = fopen (filename, "r");
+  if (file == NULL) {
+    fprintf(stderr, "ERROR: unable to open config file %s\n", filename);
+    return 1;
+  }
+
+  /* parse config line */
+  while(fgets(line, sizeof(line), file) != NULL) {
+    char *key = line;
+    char *val = NULL;
+    char *pos = line+strlen(line)-1;
+
+    if (strlen(line) > 0 && line[0] == '#')
+      continue;
+
+    while (pos >= key && (*pos == '\n' || *pos == ' ')) {
+      *pos = '\0';
+      pos--;
+    }
+
+    if (strlen(key) == 0)
+      continue;
+
+    pos = strchr(line, '=');
+    if (pos) {
+      val = pos+1;
+      while (*val == ' ' && *val != '\0') val++;
+      do {
+        *pos = '\0';
+        pos--;
+      } while (pos >= key && *pos == ' ');
+    }
+
+    ret += srs_milter_configure(key, val);
+  }
+
+  fclose(file);
+
+  return ret;
 }
 
 int is_local_addr(const char *addr) {
@@ -712,7 +844,7 @@ void usage(char *argv0) {
   printf("  %s [--forward] [--reverse] \\\n", argv0);
   printf("    --socket unix:/var/run/srs-milter.sock \\\n");
   printf("    --srs-domain=example.com --srs-secret-file=secret-file \\\n");
-  printf("    [--domain=example.com] [--domain=.example.com ...]\n");
+  printf("    [--local-domain=example.com] [--local-domain=.example.com ...]\n");
   printf("\n");
   printf("options:\n");
   printf("  -h, --help\n");
@@ -721,6 +853,8 @@ void usage(char *argv0) {
   printf("      don't daemonize this process\n");
   printf("  -v, --verbose\n");
   printf("      verbose output\n");
+  printf("  -C, --config\n");
+  printf("      configuration file (use long variant of command line options)\n");
   printf("  -P, --pidfile\n");
   printf("      filename where to store process PID\n");
   printf("  -s, --socket\n");
@@ -733,7 +867,7 @@ void usage(char *argv0) {
   printf("      SRS encode the envelope sender of non-local-destined mail\n");
   printf("  -r, --reverse\n");
   printf("      SRS decode any envelope recipients of local SRS addresses\n");
-  printf("  -m, --domain\n");
+  printf("  -m, --local-domain\n");
   printf("      all local mail domains for that we accept mail\n");
   printf("      starting domain name with \".\" match also all subdomains\n");
   printf("  -o, --srs-domain\n");
@@ -750,7 +884,7 @@ void usage(char *argv0) {
   printf("  -x, --srs-maxage\n");
   printf("  -e, --srs-separator\n");
   printf("      SRS address separator, must be one of '+' '-' '=' (default: libsrs2 default)\n");
-  printf("  -c, --spf-check\n");
+  printf("  -k, --spf-check\n");
   printf("      use SRS only when sender's SPF record will (soft)fail us\n");
   printf("  -l, --spf-heloname\n");
   printf("      use this heloname for SPF checks (default: gethostname())\n");
@@ -765,7 +899,6 @@ void usage(char *argv0) {
 int main(int argc, char* argv[]) {
   int c, i;
   int debug_flag = 0;
-  char *address = NULL;
   FILE *f;
 
   static struct option long_options[] = {
@@ -790,6 +923,7 @@ int main(int argc, char* argv[]) {
     {"srs-domain",             required_argument, 0, 'o'},
     {"srs-always",             no_argument,       0, 'y'},
     {"srs-secret",             required_argument, 0, 'c'},
+    {"srs-secret-file",        required_argument, 0, 'C'},
     {"srs-alwaysrewrite",      no_argument,       0, 'w'},
     {"srs-hashlength",         required_argument, 0, 'g'},
     {"srs-hashmin",            required_argument, 0, 'i'},
@@ -800,6 +934,28 @@ int main(int argc, char* argv[]) {
 
   /* reset configuration */
   memset(&config, 0, sizeof(config_t));
+
+  /* find config file in command line arguments */
+  while (1) {
+    /* getopt_long stores the option index here. */
+    int option_index = 0;
+
+    c = getopt_long(argc, argv, "hdvP:s:t:f:r:mk:t:l:a:o:yc:C:wg:i:x:e:",
+                    long_options, &option_index);
+
+    /* Detect the end of the options. */
+    if (c == -1)
+      break;
+
+    if (c != 'C')
+      continue;
+
+    if (srs_milter_load_config(optarg) != 0)
+      exit(EXIT_FAILURE);
+  }
+
+  /* reset getopt */
+  optind = 1;
 
   while (1) {
     /* getopt_long stores the option index here. */
@@ -833,109 +989,74 @@ int main(int argc, char* argv[]) {
         break;
 
       case 'v':
-        config.verbose = 1;
-        break;
-
-      case 'P':
-        f = fopen(optarg, "w");
-        fprintf(f, "%i", (int) getpid());
-        fclose(f);
-        break;
-
-      case 's':
-        config.socket = optarg;
-        break;
-
-      case 't':
-        if (optarg == NULL || *optarg == '\0') {
-          fprintf(stderr, "ERROR: illegal timeout %s\n", optarg);
-          exit(EXIT_FAILURE);
-        }
-        if (smfi_settimeout(atoi(optarg)) == MI_FAILURE) {
-          fprintf(stderr, "ERROR: can't set milter timeout %s\n", optarg);
-          exit(EXIT_FAILURE);
-        }
-        break;
-
-      case 'f':
-        config.forward = 1;
-        break;
-
-      case 'r':
-        config.reverse = 1;
-        break;
-
-      case 'm':
-        i = 0;
-        if (!config.domains) {
-          config.domains = (char **) malloc((i+2)*sizeof(char *));
-        } else {
-          while (config.domains[i]) i++;
-          config.domains = (char **) realloc(config.domains, (i+2)*sizeof(char *));
-        }
-        config.domains[i] = optarg;
-        config.domains[i+1] = NULL;
-        break;
-
-      case 'k':
-        config.spf_check = 1;
-        break;
-
-      case 'c':
-        i = 0;
-        if (!config.srs_secrets) {
-          config.srs_secrets = (char **) malloc((i+2)*sizeof(char *));
-        } else {
-          while (config.srs_secrets[i]) i++;
-          config.srs_secrets = (char **) realloc(config.srs_secrets, (i+2)*sizeof(char *));
-        }
-        config.srs_secrets[i] = strdup(optarg); // We free secrets on exit because some may be allocated from a file
-        config.srs_secrets[i+1] = NULL;
+        srs_milter_configure("verbose", NULL);
         break;
 
       case 'C':
-        {
-          char *err = srs_milter_load_file_secrets(&config.srs_secrets, optarg);
-          if (err) {
-            usage(argv[0]);
-            fprintf(stderr, err);
-            exit(EXIT_FAILURE);
-          }
-        }
+        break;
+
+      case 'P':
+        srs_milter_configure("pidfile", optarg);
+        break;
+
+      case 's':
+        srs_milter_configure("socket", optarg);
+        break;
+
+      case 't':
+        srs_milter_configure("timeout", optarg);
+        break;
+
+      case 'f':
+        srs_milter_configure("forward", NULL);
+        break;
+
+      case 'r':
+        srs_milter_configure("reverse", NULL);
+        break;
+
+      case 'm':
+        srs_milter_configure("local-domain", optarg);
+        break;
+
+      case 'k':
+        srs_milter_configure("spf_check", NULL);
+        break;
+
+      case 'c':
+        srs_milter_configure("spf_secret", optarg);
         break;
 
       case 'l':
-        config.spf_heloname = optarg;
+        srs_milter_configure("spf_heloname", optarg);
         break;
 
       case 'a':
-        address = optarg;
+        srs_milter_configure("spf_address", optarg);
         break;
 
       case 'o':
-        if (config.srs_domain)
-          free(config.srs_domain);
-        config.srs_domain = strdup(optarg);
+        srs_milter_configure("srs_domain", optarg);
         break;
 
       case 'w':
-        config.srs_alwaysrewrite = 1;
+        srs_milter_configure("srs_alwaysrewrite", NULL);
         break;
 
       case 'g':
-        config.srs_hashlength = atoi(optarg);
+        srs_milter_configure("srs_hashlength", optarg);
         break;
 
       case 'i':
-        config.srs_hashmin = atoi(optarg);
+        srs_milter_configure("srs_hashmin", optarg);
         break;
 
       case 'x':
-        config.srs_maxage = atoi(optarg);
+        srs_milter_configure("srs_maxage", optarg);
         break;
 
       case 'e':
-        config.srs_separator = optarg[0];
+        srs_milter_configure("srs_separator", optarg);
         break;
 
       case '?':
@@ -953,6 +1074,16 @@ int main(int argc, char* argv[]) {
     while (optind < argc)
       printf ("%s ", argv[optind++]);
     putchar ('\n');
+  }
+
+  if (config.pidfile) {
+    f = fopen(config.pidfile, "w");
+    if (!f) {
+      fprintf(stderr, "ERROR: can't open PID file %s\n", config.pidfile);
+      exit(EXIT_FAILURE);
+    }
+    fprintf(f, "%i", (int) getpid());
+    fclose(f);
   }
 
   if (pthread_key_create(&key, &srs_milter_thread_data_destructor)) {
@@ -1017,15 +1148,7 @@ int main(int argc, char* argv[]) {
         gethostname(config.spf_heloname, 63);
       }
 
-      if (address) {
-        if (inet_pton(AF_INET, address, &config.spf_address) <= 0)
-          if (inet_pton(AF_INET6, address, &config.spf_address) <= 0) {
-            usage(argv[0]);
-            fprintf(stderr, "ERROR: invalid SPF address %s\n", address);
-            exit(EXIT_FAILURE);
-          }
-      } else {
-
+      if (!config.spf_address_defined) {
         // get local address
         struct ifaddrs *ifAddrStruct = NULL;
         struct ifaddrs *ifa = NULL;
@@ -1092,18 +1215,22 @@ int main(int argc, char* argv[]) {
 
     // print configuration
     if (config.verbose) {
+      if (config.pidfile)
+        syslog(LOG_DEBUG, "config pidfile: %s", config.pidfile);
       if (config.forward)
         syslog(LOG_DEBUG, "config forward: %i", config.forward);
       if (config.reverse)
         syslog(LOG_DEBUG, "config reverse: %i", config.reverse);
       if (config.socket)
         syslog(LOG_DEBUG, "config socket: %s", config.socket);
+      if (config.timeout)
+        syslog(LOG_DEBUG, "config timeout: %i", config.timeout);
       for (i = 0; config.domains && config.domains[i]; i++)
-        syslog(LOG_DEBUG, "config local_mail_domains: %s", config.domains[i]);
+        syslog(LOG_DEBUG, "config local_domain: %s", config.domains[i]);
       if (config.srs_domain)
         syslog(LOG_DEBUG, "config srs_domain: %s", config.srs_domain);
       for (i = 0; config.srs_secrets && config.srs_secrets[i]; i++)
-        syslog(LOG_DEBUG, "config srs_secrets: %s", config.srs_secrets[i]);
+        syslog(LOG_DEBUG, "config srs_secret: %s", config.srs_secrets[i]);
       if (config.srs_alwaysrewrite > 0)
         syslog(LOG_DEBUG, "config srs_alwaysrewrite: %i", config.srs_alwaysrewrite);
       if (config.srs_hashlength > 0)
@@ -1144,6 +1271,10 @@ int main(int argc, char* argv[]) {
     fprintf(stderr, "%s: register failed\n", SRS_MILTER_NAME);
     exit(EXIT_FAILURE);
   }
+  if (smfi_settimeout(config.timeout) == MI_FAILURE) {
+    fprintf(stderr, "%s: can't set milter timeout to %i\n", SRS_MILTER_NAME, config.timeout);
+    exit(EXIT_FAILURE);
+  }
   if (smfi_main() == MI_FAILURE) {
     fprintf(stderr, "%s: milter failed\n", SRS_MILTER_NAME);
     exit(EXIT_FAILURE);
@@ -1152,6 +1283,13 @@ int main(int argc, char* argv[]) {
   // Free the secrets
   {
     char **s = config.srs_secrets;
+    do {
+      free(*s);
+    } while (*++s != NULL);
+  }
+  // Free the secrets
+  {
+    char **s = config.domains;
     do {
       free(*s);
     } while (*++s != NULL);

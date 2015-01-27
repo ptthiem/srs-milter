@@ -63,6 +63,17 @@ Outgoing mail:
 
 * NOTE: If you use virtual_alias_maps for outgoing mails to change recipient address you can't use same smtpd with srs-milter (it doesn't see changes from rewriting virtual aliases). In main.cf you can define new smtpd that listens on different port and forward all outgoing mails throught this smtpd configured with srs-milter.
 
+Service startup
+---------------
+
+SysV initscript (service configuration via /etc/sysconfig/srs-milter):
+  ```
+  # enable srs-milter service
+  /sbin/chkconfig srs-milter on
+  # start srs-milter service
+  /sbin/service srs-milter start
+  ```
+
 Other notes
 -----------
 

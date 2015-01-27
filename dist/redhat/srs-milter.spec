@@ -4,12 +4,16 @@ Version:        0.0.2
 Release:        1
 License:        GPL
 Group:          System Environment/Daemons
-URL:            http://kmlinux.fjfi.cvut.cz/~vokacpet/activities/srs-milter
-Source0:        http://kmlinux.fjfi.cvut.cz/~vokacpet/activities/srs-milter/%{name}-%{version}.tar.gz
+URL:            https://github.com/vokac/srs-milter
+Source0:        %{name}-%{version}.tar.gz
 BuildRoot:      %{_tmppath}/%{name}-%{version}-%{release}-root-%(%{__id_u} -n)
 BuildRequires:  sendmail-devel
-Requires:       /usr/sbin/sendmail
-
+BuildRequires:  sendmail-devel libsrs2 libspf2
+%if 0%{?rhel} < 6
+Requires:       sendmail
+%else
+Requires:       sendmail-milter
+%endif
 Requires(pre):  /usr/bin/getent, /usr/sbin/groupadd, /usr/sbin/useradd, /usr/sbin/usermod
 Requires(post): /sbin/chkconfig
 Requires(post): /sbin/service
@@ -45,6 +49,9 @@ socket to communicate with the Postfix MTA.
 
 %{__install} -D -m0755 dist/redhat/srs-milter.init %{buildroot}%{_initrddir}/srs-milter
 %{__install} -D -m0644 dist/redhat/srs-milter.sysconfig %{buildroot}%{_sysconfdir}/sysconfig/srs-milter
+%{__install} -D -m0644 dist/redhat/srs-milter.default.conf %{buildroot}%{_sysconfdir}/srs-milter.default.conf
+%{__install} -D -m0644 dist/redhat/srs-milter.forward.conf %{buildroot}%{_sysconfdir}/srs-milter.forward.conf
+%{__install} -D -m0644 dist/redhat/srs-milter.reverse.conf %{buildroot}%{_sysconfdir}/srs-milter.reverse.conf
 %{__install} -d -m0755 %{buildroot}%{_localstatedir}/lib/srs-milter
 %{__install} -d -m0750 %{buildroot}%{_localstatedir}/run/srs-milter
 %{__install} -d -m0750 %{buildroot}%{_localstatedir}/run/srs-milter/postfix
@@ -83,9 +90,12 @@ fi
 
 %files
 %defattr(-,root,root,-)
-%doc README.md
+%doc README.md dist/redhat/*.conf
 %config(noreplace) %{_sysconfdir}/sysconfig/srs-milter
 %{_initrddir}/srs-milter
+%config(noreplace) %{_sysconfdir}/srs-milter.default.conf
+%config(noreplace) %{_sysconfdir}/srs-milter.forward.conf
+%config(noreplace) %{_sysconfdir}/srs-milter.reverse.conf
 %{_sbindir}/srs-milter
 %dir %attr(-,srs-milt,srs-milt) %{_localstatedir}/lib/srs-milter
 %dir %attr(-,srs-milt,srs-milt) %{_localstatedir}/run/srs-milter
@@ -95,6 +105,9 @@ fi
 %dir %attr(-,sa-milt,postfix) %{_localstatedir}/run/srs-milter/postfix/
 
 %changelog
+* Tue Jan 27 2015 Petr Vokac <vokac@fjfi.cvut.cz> - 0.0.2-1
+- Read full configuration also from config file
+
 * Sun Mar 9 2014 Jason Woods <packages@jasonwoods.me.uk> - 0.0.1-3
 - Use new repository paths
 - Service daemon name is now changed in .init
