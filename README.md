@@ -74,6 +74,14 @@ SysV initscript (service configuration via /etc/sysconfig/srs-milter):
   /sbin/service srs-milter start
   ```
 
+Systemd (service configuration via /etc/srs-milter.*.conf files):
+  ```
+  # enable srs-milter service
+  systemctl enable srs-milter@default
+  # start srs-milter service
+  systemctl start srs-milter@default
+  ```
+
 Other notes
 -----------
 

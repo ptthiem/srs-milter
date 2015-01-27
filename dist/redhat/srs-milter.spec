@@ -7,7 +7,6 @@ Group:          System Environment/Daemons
 URL:            https://github.com/vokac/srs-milter
 Source0:        %{name}-%{version}.tar.gz
 BuildRoot:      %{_tmppath}/%{name}-%{version}-%{release}-root-%(%{__id_u} -n)
-BuildRequires:  sendmail-devel
 BuildRequires:  sendmail-devel libsrs2 libspf2
 %if 0%{?rhel} < 6
 Requires:       sendmail
@@ -15,10 +14,17 @@ Requires:       sendmail
 Requires:       sendmail-milter
 %endif
 Requires(pre):  /usr/bin/getent, /usr/sbin/groupadd, /usr/sbin/useradd, /usr/sbin/usermod
+%if 0%{?rhel} >= 7 || 0%{?fedora} >= 18
+Requires(post): systemd
+Requires(preun): systemd
+Requires(postun): systemd
+BuildRequires: systemd
+%else
 Requires(post): /sbin/chkconfig
 Requires(post): /sbin/service
 Requires(preun): /sbin/chkconfig, initscripts
 Requires(postun): initscripts
+%endif
 
 %description
 The srs-milter package is an implementation of the SRS standard
@@ -47,8 +53,12 @@ socket to communicate with the Postfix MTA.
 %install
 %{__rm} -rf %{buildroot}
 
-%{__install} -D -m0755 dist/redhat/srs-milter.init %{buildroot}%{_initrddir}/srs-milter
+%if 0%{?rhel} >= 7 || 0%{?fedora} >= 18
+%{__install} -D -m0644 dist/redhat/srs-milter@.service %{buildroot}%{_unitdir}/%{name}@.service
+%else
 %{__install} -D -m0644 dist/redhat/srs-milter.sysconfig %{buildroot}%{_sysconfdir}/sysconfig/srs-milter
+%{__install} -D -m0755 dist/redhat/srs-milter.init %{buildroot}%{_initrddir}/srs-milter
+%endif
 %{__install} -D -m0644 dist/redhat/srs-milter.default.conf %{buildroot}%{_sysconfdir}/srs-milter.default.conf
 %{__install} -D -m0644 dist/redhat/srs-milter.forward.conf %{buildroot}%{_sysconfdir}/srs-milter.forward.conf
 %{__install} -D -m0644 dist/redhat/srs-milter.reverse.conf %{buildroot}%{_sysconfdir}/srs-milter.reverse.conf
@@ -68,16 +78,28 @@ socket to communicate with the Postfix MTA.
 exit 0
 
 %post
+%if 0%{?rhel} >= 7 || 0%{?fedora} >= 18
+%systemd_post srs-milter.service
+%else
 /sbin/chkconfig --add srs-milter || :
+%endif
 
 %preun
+%if 0%{?rhel} >= 7 || 0%{?fedora} >= 18
+%systemd_preun srs-milter.service
+%else
 if [ $1 -eq 0 ]; then
     %{_initrddir}/srs-milter stop &>/dev/null || :
     /sbin/chkconfig --del srs-milter || :
 fi
+%endif
 
 %postun
+%if 0%{?rhel} >= 7 || 0%{?fedora} >= 18
+%systemd_postun_with_restart srs-milter.service
+%else
 %{_initrddir}/srs-milter condrestart &>/dev/null || :
+%endif
 
 #%post postfix
 # This is needed because the milter needs to "give away" the MTA communication
@@ -91,8 +113,12 @@ fi
 %files
 %defattr(-,root,root,-)
 %doc README.md dist/redhat/*.conf
-%config(noreplace) %{_sysconfdir}/sysconfig/srs-milter
+%if 0%{?rhel} >= 7 || 0%{?fedora} >= 18
+%{_unitdir}/%{name}@.service
+%else
 %{_initrddir}/srs-milter
+%config(noreplace) %{_sysconfdir}/sysconfig/srs-milter
+%endif
 %config(noreplace) %{_sysconfdir}/srs-milter.default.conf
 %config(noreplace) %{_sysconfdir}/srs-milter.forward.conf
 %config(noreplace) %{_sysconfdir}/srs-milter.reverse.conf
@@ -107,6 +133,7 @@ fi
 %changelog
 * Tue Jan 27 2015 Petr Vokac <vokac@fjfi.cvut.cz> - 0.0.2-1
 - Read full configuration also from config file
+- Startup configuration for systemd
 
 * Sun Mar 9 2014 Jason Woods <packages@jasonwoods.me.uk> - 0.0.1-3
 - Use new repository paths
