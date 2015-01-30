@@ -8,7 +8,7 @@ Type=forking
 User=srs-milt
 Group=srs-milt
 PIDFile=/var/run/srs-milter.%i.pid
-ExecStart=/usr/sbin/srs-milter --config=/etc/srs-milter.%i.conf --pidfile=/var/run/srs-milter.%i.pid
+ExecStart=/usr/sbin/srs-milter --config=/etc/srs-milter.%i.conf --pidfile=/var/run/srs-milter/%i.pid
 PrivateTmp=true
 PrivateDevices=true
 ProtectSystem=full
