@@ -1076,16 +1076,6 @@ int main(int argc, char* argv[]) {
     putchar ('\n');
   }
 
-  if (config.pidfile) {
-    f = fopen(config.pidfile, "w");
-    if (!f) {
-      fprintf(stderr, "ERROR: can't open PID file %s\n", config.pidfile);
-      exit(EXIT_FAILURE);
-    }
-    fprintf(f, "%i", (int) getpid());
-    fclose(f);
-  }
-
   if (pthread_key_create(&key, &srs_milter_thread_data_destructor)) {
       fprintf(stderr, "pthread_key_create failed");
       exit(EXIT_FAILURE);
@@ -1264,6 +1254,16 @@ int main(int argc, char* argv[]) {
       daemonize();
       syslog(LOG_NOTICE, "daemonized PID %i", (int) ppid);
     }
+  }
+
+  if (config.pidfile) {
+    f = fopen(config.pidfile, "w");
+    if (!f) {
+      fprintf(stderr, "ERROR: can't open PID file %s\n", config.pidfile);
+      exit(EXIT_FAILURE);
+    }
+    fprintf(f, "%i", (int) getpid());
+    fclose(f);
   }
 
   smfi_setconn(config.socket);
