@@ -68,6 +68,12 @@ socket to communicate with the Postfix MTA.
 %{__install} -D -m0755 src/srs-filter %{buildroot}%{_sbindir}/srs-milter
 #%{__strip} %{buildroot}%{_sbindir}/srs-milter
 
+%{__install} -p -d %{buildroot}%{_sysconfdir}/tmpfiles.d
+cat > %{buildroot}%{_sysconfdir}/tmpfiles.d/%{name}.conf <<'EOF'
+D %{_localstatedir}/run/%{name} 0750 srs-milt srs-milt -
+EOF
+
+
 %pre
 /usr/bin/getent group srs-milt >/dev/null || /usr/sbin/groupadd -r srs-milt
 /usr/bin/getent passwd srs-milt >/dev/null || \
@@ -122,6 +128,7 @@ fi
 %config(noreplace) %{_sysconfdir}/srs-milter.default.conf
 %config(noreplace) %{_sysconfdir}/srs-milter.forward.conf
 %config(noreplace) %{_sysconfdir}/srs-milter.reverse.conf
+%config(noreplace) %{_sysconfdir}/tmpfiles.d/%{name}.conf
 %{_sbindir}/srs-milter
 %dir %attr(-,srs-milt,srs-milt) %{_localstatedir}/lib/srs-milter
 %dir %attr(-,srs-milt,srs-milt) %{_localstatedir}/run/srs-milter
