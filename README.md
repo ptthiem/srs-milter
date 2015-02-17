@@ -18,6 +18,19 @@ Dependencies
 
 Both libraries contain several patches that are not part of official source code but comes from different distributions (debian, freebsd).
 
+Installation
+------------
+
+### Building sources
+
+* clone github srs-milter repository
+* compile source in `src` subdirectory using `make` command
+* startup script/unit available in `dist` subdirectory
+
+### RPM packages
+
+Source and binary packages for RHEL/CentOS/Fedora available in repositories at http://copr.fedoraproject.org/coprs/vokac/srs-milter/
+
 Configuration
 -------------
 
