@@ -849,10 +849,10 @@ void usage(char *argv0) {
   printf("options:\n");
   printf("  -h, --help\n");
   printf("      this help message\n");
-  printf("  -d, --debug\n");
-  printf("      don't daemonize this process\n");
   printf("  -v, --verbose\n");
   printf("      verbose output\n");
+  printf("  -d, --daemon\n");
+  printf("      daemonize this process\n");
   printf("  -C, --config\n");
   printf("      configuration file (use long variant of command line options)\n");
   printf("  -P, --pidfile\n");
@@ -898,7 +898,7 @@ void usage(char *argv0) {
 
 int main(int argc, char* argv[]) {
   int c, i;
-  int debug_flag = 0;
+  int daemon = 0;
   FILE *f;
 
   static struct option long_options[] = {
@@ -908,8 +908,8 @@ int main(int argc, char* argv[]) {
     /* These options don't set a flag.
        We distinguish them by their indices. */
     {"help",                   no_argument,       0, 'h'},
-    {"debug",                  no_argument,       0, 'd'},
     {"verbose",                no_argument,       0, 'v'},
+    {"daemon",                 no_argument,       0, 'd'},
     {"config",                 required_argument, 0, 'C'},
     {"pidfile",                required_argument, 0, 'P'},
     {"socket",                 required_argument, 0, 's'},
@@ -985,7 +985,7 @@ int main(int argc, char* argv[]) {
         break;
 
       case 'd':
-        debug_flag = 1;
+        daemon = 1;
         break;
 
       case 'v':
@@ -1250,7 +1250,7 @@ int main(int argc, char* argv[]) {
 
   {
     pid_t ppid = getpid();
-    if (!debug_flag) {
+    if (daemon) {
       daemonize();
       syslog(LOG_NOTICE, "daemonized PID %i", (int) ppid);
     }
@@ -1271,9 +1271,11 @@ int main(int argc, char* argv[]) {
     fprintf(stderr, "%s: register failed\n", SRS_MILTER_NAME);
     exit(EXIT_FAILURE);
   }
-  if (smfi_settimeout(config.timeout) == MI_FAILURE) {
-    fprintf(stderr, "%s: can't set milter timeout to %i\n", SRS_MILTER_NAME, config.timeout);
-    exit(EXIT_FAILURE);
+  if (config.timeout) {
+    if (smfi_settimeout(config.timeout) == MI_FAILURE) {
+      fprintf(stderr, "%s: can't set milter timeout to %i\n", SRS_MILTER_NAME, config.timeout);
+      exit(EXIT_FAILURE);
+    }
   }
   if (smfi_main() == MI_FAILURE) {
     fprintf(stderr, "%s: milter failed\n", SRS_MILTER_NAME);
