@@ -5,14 +5,10 @@
 #include <getopt.h>
 #include <unistd.h>
 #include <string.h>
-#include <strings.h>
 #include <pthread.h>
 #include <syslog.h>
 #include <sys/stat.h>
-#include <sys/types.h>
 #include <sys/socket.h>
-#include <sys/ioctl.h>
-#include <sys/file.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <ifaddrs.h>
@@ -465,30 +461,28 @@ xxfi_srs_milter_envrcpt(SMFICTX* ctx, char** argv) {
 
   if (!is_local_addr(recip)) {
     cd->recip_remote = 1;
-  } else {
-    // list of local SRS recipient addresses that should be reversed
-    if (recip[0] != '\0' && recip[1] != '\0' 
-        && recip[2] != '\0' && recip[3] != '\0'
-        && SRS_IS_SRS_ADDRESS(recip)) {
-      int argc = 0;
+  }
+  // list of local SRS recipient addresses that should be reversed
+  if (recip[0] != '\0' && recip[1] != '\0'
+      && recip[2] != '\0' && recip[3] != '\0' && (SRS_IS_SRS_ADDRESS(recip) || cd->recip_remote == 1)) {
+    int argc = 0;
 
-      if (!cd->recip) {
-        cd->recip = (char **) malloc((argc+2)*sizeof(char *));
-      } else {
-        while (argv[argc]) argc++;
-        cd->recip = (char **) realloc(cd->recip, (argc+2)*sizeof(char *));
-      }
+    if (!cd->recip) {
+      cd->recip = (char **) malloc((argc+2)*sizeof(char *));
+    } else {
+      while (argv[argc]) argc++;
+      cd->recip = (char **) realloc(cd->recip, (argc+2)*sizeof(char *));
+    }
 
-      if (!cd->recip) {
+    if (!cd->recip) {
+      // memory allocation problem
+      cd->state |= SS_STATE_INVALID_MSG;
+    } else {
+      cd->recip[argc] = strdup(argv[0]);
+      cd->recip[argc+1] = NULL;
+      if (!cd->recip[argc]) {
         // memory allocation problem
         cd->state |= SS_STATE_INVALID_MSG;
-      } else {
-        cd->recip[argc] = strdup(argv[0]);
-        cd->recip[argc+1] = NULL;
-        if (!cd->recip[argc]) {
-          // memory allocation problem
-          cd->state |= SS_STATE_INVALID_MSG;
-        }
       }
     }
   }
@@ -639,7 +633,7 @@ xxfi_srs_milter_eom(SMFICTX* ctx) {
   }
 
   // now, do some SRS magic...
-  if (fix_envfrom || (config.reverse && cd->recip)) {
+  if (fix_envfrom || (config.reverse && cd->recip && cd->recip_remote == 0)) {
     int i;
     struct srs_milter_thread_data* td;
 
@@ -683,7 +677,13 @@ xxfi_srs_milter_eom(SMFICTX* ctx) {
 
     if (fix_envfrom) {
       // modify MAIL FROM: address to SRS format
-      if ((srs_res = srs_forward_alloc(td->srs, &out, cd->sender, config.srs_domain)) == SRS_SUCCESS) {
+      char* recip;
+      if (strcmp(config.srs_domain, "recipient_domain") == 0) {
+        recip = cd->recip[0];
+      } else {
+        recip = config.srs_domain;
+      }
+      if ((srs_res = srs_forward_alloc(td->srs, &out, cd->sender, recip)) == SRS_SUCCESS) {
         if (smfi_chgfrom(ctx, out, NULL) != MI_SUCCESS) {
           syslog(LOG_ERR, "conn# %d[%i][%s][%i] - xxfi_srs_milter_eom(): smfi_chgfrom(ctx, %s, NULL) failed",
                  cd->num, cd->state, queue_id, td->num, out);
@@ -701,7 +701,7 @@ xxfi_srs_milter_eom(SMFICTX* ctx) {
         free(out);
     }
 
-    if (config.reverse && cd->recip) {
+    if (config.reverse && cd->recip && cd->recip_remote == 0) {
       // modify RCPT TO: by removing SRS format
       for (i = 0; cd->recip[i]; i++) {
         if ((srs_res = srs_reverse_alloc(td->srs, &out, cd->recip[i])) == SRS_SUCCESS) {
@@ -1036,7 +1036,7 @@ int main(int argc, char* argv[]) {
         break;
 
       case 'o':
-        srs_milter_configure("srs_domain", optarg);
+        srs_milter_configure("srs-domain", optarg);
         break;
 
       case 'w':
